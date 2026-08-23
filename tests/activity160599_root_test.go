@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -53,6 +54,141 @@ func TestActivity160599SameSizeWALRecycleIsNotIdle(t *testing.T) {
 	}
 	if info.reason == "" {
 		t.Fatal("recycled WAL must have a diagnostic reason")
+	}
+}
+
+func TestActivity160599RestoreRefusesExistingDestination(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "existing.db")
+	want := []byte("existing database must remain untouched")
+	if err := os.WriteFile(output, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := NewReplicaWithClient(nil, &activity160599Client{}).Restore(
+		context.Background(), RestoreOptions{OutputPath: output},
+	)
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("restore error=%v, want existing-destination refusal", err)
+	}
+	got, readErr := os.ReadFile(output)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("existing destination changed: got %q, want %q", got, want)
+	}
+}
+
+func TestActivity160599RestoreTargetAndTimestampSemantics(t *testing.T) {
+	snapshot := &ltx.FileInfo{
+		Level: SnapshotLevel, MinTXID: 1, MaxTXID: 1,
+		Size: ltx.HeaderSize, CreatedAt: time.Unix(100, 0),
+	}
+	increment2 := &ltx.FileInfo{
+		Level: 0, MinTXID: 2, MaxTXID: 2,
+		Size: ltx.HeaderSize, CreatedAt: time.Unix(200, 0),
+	}
+	increment3 := &ltx.FileInfo{
+		Level: 0, MinTXID: 3, MaxTXID: 3,
+		Size: ltx.HeaderSize, CreatedAt: time.Unix(300, 0),
+	}
+	client := &activity160599Client{files: func(level int) []*ltx.FileInfo {
+		switch level {
+		case SnapshotLevel:
+			return []*ltx.FileInfo{snapshot}
+		case 0:
+			return []*ltx.FileInfo{increment2, increment3}
+		default:
+			return nil
+		}
+	}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	assertTarget := func(name string, txid ltx.TXID, timestamp time.Time, want ltx.TXID) {
+		t.Helper()
+		plan, err := CalcRestorePlan(context.Background(), client, txid, timestamp, logger)
+		if err != nil {
+			t.Fatalf("%s: calc restore plan: %v", name, err)
+		}
+		if len(plan) == 0 || plan[len(plan)-1].MaxTXID != want {
+			t.Fatalf("%s: plan=%v, want final txid %s", name, plan, want)
+		}
+	}
+
+	assertTarget("explicit txid", 2, time.Time{}, 2)
+	assertTarget("point in time", 0, time.Unix(250, 0), 2)
+	assertTarget("timestamp boundary is exclusive", 0, time.Unix(200, 0), 1)
+	if _, err := CalcRestorePlan(context.Background(), client, 2, time.Unix(250, 0), logger); err == nil {
+		t.Fatal("expected simultaneous txid and timestamp targets to be rejected")
+	}
+}
+
+func TestActivity160599LTXWireFormatRejectsSQLiteLockPage(t *testing.T) {
+	const pageSize = 4096
+	lockPgno := ltx.LockPgno(pageSize)
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum,
+		PageSize: pageSize, Commit: lockPgno, MinTXID: 2, MaxTXID: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err = enc.EncodePage(
+		ltx.PageHeader{Pgno: lockPgno},
+		bytes.Repeat([]byte{0xE7}, pageSize),
+	)
+	if err == nil || !strings.Contains(err.Error(), "lock page") {
+		t.Fatalf("encode lock page error=%v, want explicit refusal", err)
+	}
+}
+
+func TestActivity160599ContinuousRestoreNormalizesSQLiteHeader(t *testing.T) {
+	const pageSize = 4096
+	page1 := bytes.Repeat([]byte{0x71}, pageSize)
+	page1[18], page1[19] = 0x02, 0x02
+	binary.BigEndian.PutUint32(page1[24:28], 0x11223344)
+	data := activity160599BuildLTX(
+		t, 2, 2, pageSize, 1, page1, 7, 8, WALHeaderSize, WALFrameHeaderSize+pageSize,
+	)
+	info := &ltx.FileInfo{Level: 0, MinTXID: 2, MaxTXID: 2, Size: int64(len(data))}
+	client := &activity160599Client{
+		files: func(level int) []*ltx.FileInfo {
+			if level == 0 {
+				return []*ltx.FileInfo{info}
+			}
+			return nil
+		},
+		open: func(level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			return activity160599RangeReader(data, offset, size)
+		},
+	}
+
+	path := filepath.Join(t.TempDir(), "lock-page.db")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := f.Truncate(pageSize); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := NewReplicaWithClient(nil, client).applyLTXFile(context.Background(), f, info, pageSize); err != nil {
+		t.Fatalf("apply continuous restore update: %v", err)
+	}
+	header := make([]byte, 28)
+	if _, err := f.ReadAt(header, 0); err != nil {
+		t.Fatal(err)
+	}
+	if header[18] != 0x01 || header[19] != 0x01 {
+		t.Fatalf("sqlite header journal bytes=%#x %#x, want DELETE mode", header[18], header[19])
+	}
+	if binary.BigEndian.Uint32(header[24:28]) == 0x11223344 {
+		t.Fatal("sqlite schema change counter was not normalized")
 	}
 }
 
@@ -311,7 +447,19 @@ func (*activity160599Client) WriteLTXFile(context.Context, int, ltx.TXID, ltx.TX
 	return nil, errors.New("unexpected write")
 }
 
+type activity160599LTXPage struct {
+	pgno uint32
+	data []byte
+}
+
 func activity160599BuildLTX(tb testing.TB, minTXID, maxTXID ltx.TXID, pageSize, commit uint32, page []byte, salt1, salt2 uint32, walOffset, walSize int64) []byte {
+	return activity160599BuildLTXPages(
+		tb, minTXID, maxTXID, pageSize, commit, salt1, salt2, walOffset, walSize,
+		activity160599LTXPage{pgno: 1, data: page},
+	)
+}
+
+func activity160599BuildLTXPages(tb testing.TB, minTXID, maxTXID ltx.TXID, pageSize, commit uint32, salt1, salt2 uint32, walOffset, walSize int64, pages ...activity160599LTXPage) []byte {
 	tb.Helper()
 	var buf bytes.Buffer
 	enc, err := ltx.NewEncoder(&buf)
@@ -326,8 +474,10 @@ func activity160599BuildLTX(tb testing.TB, minTXID, maxTXID ltx.TXID, pageSize, 
 	if err := enc.EncodeHeader(hdr); err != nil {
 		tb.Fatal(err)
 	}
-	if err := enc.EncodePage(ltx.PageHeader{Pgno: 1}, page); err != nil {
-		tb.Fatal(err)
+	for _, page := range pages {
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: page.pgno}, page.data); err != nil {
+			tb.Fatal(err)
+		}
 	}
 	if err := enc.Close(); err != nil {
 		tb.Fatal(err)
