@@ -337,6 +337,129 @@ func TestActivity160599FailedInitialRestoreNeverPublishesOrLeaksTemp(t *testing.
 	activity160599AssertNoArtifacts(t, output)
 }
 
+func TestActivity160599PermanentBackendFailureReturnsPromptly(t *testing.T) {
+	const pageSize = 4096
+	data := activity160599BuildLTX(
+		t, 1, 1, pageSize, 1, bytes.Repeat([]byte{0x61}, pageSize),
+		1, 2, WALHeaderSize, 0,
+	)
+	info := &ltx.FileInfo{
+		Level: SnapshotLevel, MinTXID: 1, MaxTXID: 1, Size: int64(len(data)),
+	}
+
+	var mu sync.Mutex
+	openCalls := 0
+	client := &activity160599Client{
+		files: func(level int) []*ltx.FileInfo {
+			if level == SnapshotLevel {
+				return []*ltx.FileInfo{info}
+			}
+			return nil
+		},
+		open: func(level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			openCalls++
+			if openCalls == 1 {
+				return activity160599ErrorReader{err: io.ErrUnexpectedEOF}, nil
+			}
+			return nil, os.ErrPermission
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := NewReplicaWithClient(nil, client).Restore(
+		ctx, RestoreOptions{OutputPath: filepath.Join(t.TempDir(), "permanent-failure.db")},
+	)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected permanent backend failure")
+	}
+	if errors.Is(err, context.DeadlineExceeded) || elapsed >= time.Second {
+		t.Fatalf("permanent backend failure did not return promptly: elapsed=%v err=%v", elapsed, err)
+	}
+	mu.Lock()
+	calls := openCalls
+	mu.Unlock()
+	if calls < 2 {
+		t.Fatalf("restore returned before exercising permanent reopen failure: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestActivity160599ConcurrentRestoresUseDistinctTemporaryFiles(t *testing.T) {
+	const pageSize = 4096
+	data := activity160599BuildLTX(
+		t, 1, 1, pageSize, 1, bytes.Repeat([]byte{0x62}, pageSize),
+		1, 2, WALHeaderSize, 0,
+	)
+	info := &ltx.FileInfo{
+		Level: SnapshotLevel, MinTXID: 1, MaxTXID: 1, Size: int64(len(data)),
+	}
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+
+	client := &activity160599Client{
+		files: func(level int) []*ltx.FileInfo {
+			if level == SnapshotLevel {
+				return []*ltx.FileInfo{info}
+			}
+			return nil
+		},
+		open: func(level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			return &activity160599BlockingReader{
+				reader: bytes.NewReader(data), entered: entered, release: release,
+			}, nil
+		},
+	}
+
+	output := filepath.Join(t.TempDir(), "concurrent.db")
+	errCh := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			errCh <- NewReplicaWithClient(nil, client).Restore(
+				context.Background(), RestoreOptions{OutputPath: output},
+			)
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent restore did not reach its staging read")
+		}
+	}
+
+	legacy, err := filepath.Glob(output + ".tmp*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unique, err := filepath.Glob(filepath.Join(filepath.Dir(output), "."+filepath.Base(output)+"-restore-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging := append(legacy, unique...)
+	if len(staging) != 2 || staging[0] == staging[1] {
+		t.Fatalf("concurrent restores share staging path(s): %v", staging)
+	}
+
+	unblock()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("concurrent restore %d: %v", i+1, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent restore did not finish after release")
+		}
+	}
+}
+
 func TestActivity160599CorruptFollowerUpdateIsAtomicThenRetryAdvances(t *testing.T) {
 	const pageSize = 4096
 	info := &ltx.FileInfo{Level: 0, MinTXID: 2, MaxTXID: 2}
@@ -415,10 +538,34 @@ type activity160599Client struct {
 	open      func(level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error)
 }
 
-func (*activity160599Client) Type() string                 { return "activity160599" }
-func (*activity160599Client) Init(context.Context) error   { return nil }
-func (*activity160599Client) SetLogger(*slog.Logger)       {}
-func (*activity160599Client) DeleteAll(context.Context) error { return nil }
+type activity160599ErrorReader struct {
+	err error
+}
+
+func (r activity160599ErrorReader) Read([]byte) (int, error) { return 0, r.err }
+func (activity160599ErrorReader) Close() error               { return nil }
+
+type activity160599BlockingReader struct {
+	once    sync.Once
+	reader  *bytes.Reader
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (r *activity160599BlockingReader) Read(p []byte) (int, error) {
+	r.once.Do(func() {
+		r.entered <- struct{}{}
+		<-r.release
+	})
+	return r.reader.Read(p)
+}
+
+func (*activity160599BlockingReader) Close() error { return nil }
+
+func (*activity160599Client) Type() string                                          { return "activity160599" }
+func (*activity160599Client) Init(context.Context) error                            { return nil }
+func (*activity160599Client) SetLogger(*slog.Logger)                                {}
+func (*activity160599Client) DeleteAll(context.Context) error                       { return nil }
 func (*activity160599Client) DeleteLTXFiles(context.Context, []*ltx.FileInfo) error { return nil }
 
 func (c *activity160599Client) LTXFiles(_ context.Context, level int, seek ltx.TXID, _ bool) (ltx.FileIterator, error) {
