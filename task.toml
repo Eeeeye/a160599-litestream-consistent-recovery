@@ -1,0 +1,30 @@
+schema_version = "1.1"
+
+[task]
+name = "talents/a160599-litestream-consistent-recovery"
+description = "Repair cross-layer consistency failures in Litestream WAL synchronization and restore publication."
+keywords = ["go", "sqlite", "litestream", "wal", "ltx", "atomicity", "judge-grading"]
+
+[metadata]
+difficulty = "hard"
+category = "programming"
+tags = ["l4", "disaster-recovery", "concurrency", "storage", "fault-injection"]
+
+[verifier]
+timeout_sec = 600.0
+
+[agent]
+timeout_sec = 7200.0
+
+[environment]
+build_timeout_sec = 3600.0
+cpus = 4
+memory_mb = 8192
+storage_mb = 10240
+gpus = 0
+allow_internet = true
+mcp_servers = []
+
+[verifier.env]
+
+[solution.env]
