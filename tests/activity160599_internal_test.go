@@ -19,26 +19,35 @@ func TestActivity160599ResumableReaderIsByteExact(t *testing.T) {
 		payload[i] = byte((i*31 + 7) % 251)
 	}
 
-	for _, cut := range []int{1, 31, 511, 4096, 8193, len(payload) - 1} {
-		t.Run(ltx.TXID(cut).String(), func(t *testing.T) {
-			opener := &activity160599Opener{data: payload}
-			r := NewResumableReader(
-				context.Background(), opener, 2, 11, 17, int64(len(payload)),
-				&activity160599FaultReader{data: payload, cut: cut},
-				slog.New(slog.NewTextHandler(io.Discard, nil)),
-			)
+	for _, failure := range []struct {
+		name string
+		err  error
+	}{
+		{name: "unexpected-eof", err: io.ErrUnexpectedEOF},
+		{name: "clean-eof", err: io.EOF},
+		{name: "connection-reset", err: errors.New("connection reset by peer")},
+	} {
+		for _, cut := range []int{0, 1, 31, 511, 4096, 8193, len(payload) - 1} {
+			t.Run(failure.name+"/"+ltx.TXID(cut).String(), func(t *testing.T) {
+				opener := &activity160599Opener{data: payload}
+				r := NewResumableReader(
+					context.Background(), opener, 2, 11, 17, int64(len(payload)),
+					&activity160599FaultReader{data: payload, cut: cut, terminalErr: failure.err},
+					slog.New(slog.NewTextHandler(io.Discard, nil)),
+				)
 
-			got, err := io.ReadAll(r)
-			if err != nil {
-				t.Fatalf("read all after interruption at %d: %v", cut, err)
-			}
-			if !bytes.Equal(got, payload) {
-				t.Fatalf("stream changed after interruption at %d: got %d bytes, want %d", cut, len(got), len(payload))
-			}
-			if offsets := opener.offsetsSnapshot(); len(offsets) != 1 || offsets[0] != int64(cut) {
-				t.Fatalf("range reopen offsets=%v, want [%d]", offsets, cut)
-			}
-		})
+				got, err := io.ReadAll(r)
+				if err != nil {
+					t.Fatalf("read all after interruption at %d: %v", cut, err)
+				}
+				if !bytes.Equal(got, payload) {
+					t.Fatalf("stream changed after interruption at %d: got %d bytes, want %d", cut, len(got), len(payload))
+				}
+				if offsets := opener.offsetsSnapshot(); len(offsets) != 1 || offsets[0] != int64(cut) {
+					t.Fatalf("range reopen offsets=%v, want [%d]", offsets, cut)
+				}
+			})
+		}
 	}
 }
 
@@ -48,7 +57,7 @@ func TestActivity160599ResumableReaderHonorsCancellation(t *testing.T) {
 	opener := &activity160599Opener{data: []byte("abcdef"), err: context.Canceled}
 	r := NewResumableReader(
 		ctx, opener, 0, 1, 1, 6,
-		&activity160599FaultReader{data: []byte("abcdef"), cut: 0},
+		&activity160599FaultReader{data: []byte("abcdef"), cut: 0, terminalErr: io.ErrUnexpectedEOF},
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 
@@ -69,10 +78,11 @@ func TestActivity160599ResumableReaderHonorsCancellation(t *testing.T) {
 }
 
 type activity160599FaultReader struct {
-	data []byte
-	cut  int
-	pos  int
-	done bool
+	data        []byte
+	cut         int
+	pos         int
+	done        bool
+	terminalErr error
 }
 
 func (r *activity160599FaultReader) Read(p []byte) (int, error) {
@@ -81,7 +91,7 @@ func (r *activity160599FaultReader) Read(p []byte) (int, error) {
 	}
 	if r.pos >= r.cut {
 		r.done = true
-		return 0, io.ErrUnexpectedEOF
+		return 0, r.terminalErr
 	}
 	n := len(p)
 	if remaining := r.cut - r.pos; n > remaining {
@@ -91,7 +101,7 @@ func (r *activity160599FaultReader) Read(p []byte) (int, error) {
 	r.pos += n
 	if r.pos == r.cut {
 		r.done = true
-		return n, io.ErrUnexpectedEOF
+		return n, r.terminalErr
 	}
 	return n, nil
 }

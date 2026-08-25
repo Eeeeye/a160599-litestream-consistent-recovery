@@ -15,10 +15,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/superfly/ltx"
 )
 
-func TestActivity160599SameSizeWALRecycleIsNotIdle(t *testing.T) {
+func TestActivity160599SameSizeWALRecycleProducesNextLTX(t *testing.T) {
 	const (
 		pageSize = 4096
 		oldSalt1 = 0x11111111
@@ -29,7 +30,21 @@ func TestActivity160599SameSizeWALRecycleIsNotIdle(t *testing.T) {
 
 	dir := t.TempDir()
 	db := NewDB(filepath.Join(dir, "source.db"))
-	ltxData := activity160599BuildLTX(t, 1, 1, pageSize, 1, bytes.Repeat([]byte{0xA1}, pageSize), oldSalt1, oldSalt2, WALHeaderSize, WALFrameHeaderSize+pageSize)
+	oldPage := bytes.Repeat([]byte{0xA1}, pageSize)
+	newPage := bytes.Repeat([]byte{0xB2}, pageSize)
+	if err := os.WriteFile(db.Path(), oldPage, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db.pageSize = pageSize
+	db.fileInfo, _ = os.Stat(db.Path())
+	db.dirInfo, _ = os.Stat(dir)
+	var err error
+	if db.f, err = os.Open(db.Path()); err != nil {
+		t.Fatal(err)
+	}
+	defer db.f.Close()
+
+	ltxData := activity160599BuildLTX(t, 1, 1, pageSize, 1, oldPage, oldSalt1, oldSalt2, WALHeaderSize, WALFrameHeaderSize+pageSize)
 	ltxPath := db.LTXPath(0, 1, 1)
 	if err := os.MkdirAll(filepath.Dir(ltxPath), 0o755); err != nil {
 		t.Fatal(err)
@@ -38,9 +53,7 @@ func TestActivity160599SameSizeWALRecycleIsNotIdle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wal := make([]byte, WALHeaderSize+WALFrameHeaderSize+pageSize)
-	binary.BigEndian.PutUint32(wal[16:], newSalt1)
-	binary.BigEndian.PutUint32(wal[20:], newSalt2)
+	wal := activity160599BuildWAL(t, pageSize, newSalt1, newSalt2, newPage)
 	if err := os.WriteFile(db.WALPath(), wal, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -54,6 +67,43 @@ func TestActivity160599SameSizeWALRecycleIsNotIdle(t *testing.T) {
 	}
 	if info.reason == "" {
 		t.Fatal("recycled WAL must have a diagnostic reason")
+	}
+
+	synced, err := db.sync(context.Background(), false, info)
+	if err != nil {
+		t.Fatalf("sync recycled WAL: %v", err)
+	}
+	if !synced {
+		t.Fatal("same-size recycled WAL did not create a new LTX transaction")
+	}
+	if pos, err := db.Pos(); err != nil {
+		t.Fatal(err)
+	} else if pos.TXID != 2 {
+		t.Fatalf("position after recycled WAL sync=%s, want 2", pos.TXID)
+	}
+
+	f, err := os.Open(db.LTXPath(0, 2, 2))
+	if err != nil {
+		t.Fatalf("open next LTX: %v", err)
+	}
+	defer f.Close()
+	dec := ltx.NewDecoder(f)
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatalf("decode next LTX header: %v", err)
+	}
+	var phdr ltx.PageHeader
+	gotPage := make([]byte, pageSize)
+	if err := dec.DecodePage(&phdr, gotPage); err != nil {
+		t.Fatalf("decode next LTX page: %v", err)
+	}
+	if phdr.Pgno != 1 || !bytes.Equal(gotPage, newPage) {
+		t.Fatalf("next LTX does not contain recycled WAL commit: pgno=%d first_byte=%#x", phdr.Pgno, gotPage[0])
+	}
+	if err := dec.DecodePage(&phdr, gotPage); !errors.Is(err, io.EOF) {
+		t.Fatalf("next LTX has unexpected additional page: %v", err)
+	}
+	if err := dec.Close(); err != nil {
+		t.Fatalf("validate next LTX trailer: %v", err)
 	}
 }
 
@@ -318,6 +368,7 @@ func TestActivity160599RestoreMissingPlanIsBoundedAndClean(t *testing.T) {
 func TestActivity160599FailedInitialRestoreNeverPublishesOrLeaksTemp(t *testing.T) {
 	bad := make([]byte, ltx.HeaderSize)
 	info := &ltx.FileInfo{Level: SnapshotLevel, MinTXID: 1, MaxTXID: 1, Size: int64(len(bad))}
+	current := bad
 	client := &activity160599Client{
 		files: func(level int) []*ltx.FileInfo {
 			if level == SnapshotLevel {
@@ -326,13 +377,138 @@ func TestActivity160599FailedInitialRestoreNeverPublishesOrLeaksTemp(t *testing.
 			return nil
 		},
 		open: func(level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
-			return activity160599RangeReader(bad, offset, size)
+			return activity160599RangeReader(current, offset, size)
 		},
 	}
 	output := filepath.Join(t.TempDir(), "atomic.db")
 	err := NewReplicaWithClient(nil, client).Restore(context.Background(), RestoreOptions{OutputPath: output, IntegrityCheck: IntegrityCheckQuick})
 	if err == nil {
 		t.Fatal("expected invalid backup to fail")
+	}
+	activity160599AssertNoArtifacts(t, output)
+
+	const pageSize = 4096
+	current = activity160599BuildLTX(
+		t, 1, 1, pageSize, 1, bytes.Repeat([]byte{0xA5}, pageSize),
+		1, 2, WALHeaderSize, 0,
+	)
+	info.Size = int64(len(current))
+	if err := NewReplicaWithClient(nil, client).Restore(
+		context.Background(), RestoreOptions{OutputPath: output},
+	); err != nil {
+		t.Fatalf("clean retry to same destination: %v", err)
+	}
+	got, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != pageSize || got[0] != 0xA5 {
+		t.Fatalf("clean retry restored wrong image: size=%d first_byte=%#x", len(got), got[0])
+	}
+}
+
+func TestActivity160599CancelledInitialRestoreNeverPublishesOrLeaksTemp(t *testing.T) {
+	const pageSize = 4096
+	data := activity160599BuildLTX(
+		t, 1, 1, pageSize, 1, bytes.Repeat([]byte{0x63}, pageSize),
+		1, 2, WALHeaderSize, 0,
+	)
+	info := &ltx.FileInfo{Level: SnapshotLevel, MinTXID: 1, MaxTXID: 1, Size: int64(len(data))}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{})
+	client := &activity160599Client{
+		files: func(level int) []*ltx.FileInfo {
+			if level == SnapshotLevel {
+				return []*ltx.FileInfo{info}
+			}
+			return nil
+		},
+		open: func(level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return &activity160599ContextReader{ctx: ctx, entered: entered}, nil
+		},
+	}
+
+	output := filepath.Join(t.TempDir(), "cancelled.db")
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- NewReplicaWithClient(nil, client).Restore(ctx, RestoreOptions{OutputPath: output})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restore did not begin reading before cancellation")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("cancelled restore returned success")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled restore did not return promptly")
+	}
+	activity160599AssertNoArtifacts(t, output)
+}
+
+func TestActivity160599IntegrityFailureNeverPublishesFinalName(t *testing.T) {
+	const pageSize = 4096
+	data := activity160599BuildLTX(
+		t, 1, 1, pageSize, 1, bytes.Repeat([]byte{0x7B}, pageSize),
+		1, 2, WALHeaderSize, 0,
+	)
+	info := &ltx.FileInfo{Level: SnapshotLevel, MinTXID: 1, MaxTXID: 1, Size: int64(len(data))}
+	client := &activity160599Client{
+		files: func(level int) []*ltx.FileInfo {
+			if level == SnapshotLevel {
+				return []*ltx.FileInfo{info}
+			}
+			return nil
+		},
+		open: func(level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			return activity160599RangeReader(data, offset, size)
+		},
+	}
+
+	dir := t.TempDir()
+	output := filepath.Join(dir, "integrity.db")
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watcher.Close()
+	if err := watcher.Add(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	err = NewReplicaWithClient(nil, client).Restore(
+		context.Background(), RestoreOptions{OutputPath: output, IntegrityCheck: IntegrityCheckQuick},
+	)
+	if err == nil {
+		t.Fatal("expected SQLite integrity check to reject invalid database image")
+	}
+
+	published := false
+	timer := time.NewTimer(150 * time.Millisecond)
+	defer timer.Stop()
+drain:
+	for {
+		select {
+		case event := <-watcher.Events:
+			if event.Name == output && event.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
+				published = true
+			}
+		case err := <-watcher.Errors:
+			t.Fatalf("watch restore directory: %v", err)
+		case <-timer.C:
+			break drain
+		}
+	}
+	if published {
+		t.Fatal("final destination name became visible before the requested integrity check succeeded")
 	}
 	activity160599AssertNoArtifacts(t, output)
 }
@@ -462,22 +638,33 @@ func TestActivity160599ConcurrentRestoresUseDistinctTemporaryFiles(t *testing.T)
 
 func TestActivity160599CorruptFollowerUpdateIsAtomicThenRetryAdvances(t *testing.T) {
 	const pageSize = 4096
-	info := &ltx.FileInfo{Level: 0, MinTXID: 2, MaxTXID: 2}
+	corruptInfo := &ltx.FileInfo{Level: 0, MinTXID: 2, MaxTXID: 2}
+	compactedInfo := &ltx.FileInfo{Level: 1, MinTXID: 2, MaxTXID: 2}
 	valid := activity160599BuildLTX(t, 2, 2, pageSize, 2, bytes.Repeat([]byte{0xD4}, pageSize), 7, 8, WALHeaderSize, WALFrameHeaderSize+pageSize)
 	corrupt := append([]byte(nil), valid...)
 	corrupt = corrupt[:len(corrupt)-7]
-	info.Size = int64(len(valid))
+	corruptInfo.Size = int64(len(valid))
+	compactedInfo.Size = int64(len(valid))
 
-	current := corrupt
+	serveCompacted := false
 	client := &activity160599Client{
 		files: func(level int) []*ltx.FileInfo {
-			if level == 0 {
-				return []*ltx.FileInfo{info}
+			if !serveCompacted && level == 0 {
+				return []*ltx.FileInfo{corruptInfo}
+			}
+			if serveCompacted && level == 1 {
+				return []*ltx.FileInfo{compactedInfo}
 			}
 			return nil
 		},
 		open: func(level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
-			return activity160599RangeReader(current, offset, size)
+			if level == 0 {
+				return activity160599RangeReader(corrupt, offset, size)
+			}
+			if level == 1 {
+				return activity160599RangeReader(valid, offset, size)
+			}
+			return nil, os.ErrNotExist
 		},
 	}
 
@@ -514,10 +701,10 @@ func TestActivity160599CorruptFollowerUpdateIsAtomicThenRetryAdvances(t *testing
 		t.Fatalf("sidecar txid=%s err=%v, want 1", txid, err)
 	}
 
-	current = valid
+	serveCompacted = true
 	gotTXID, err = r.applyNewLTXFiles(context.Background(), f, 1, pageSize)
 	if err != nil {
-		t.Fatalf("valid retry: %v", err)
+		t.Fatalf("valid compacted retry: %v", err)
 	}
 	if gotTXID != 2 {
 		t.Fatalf("txid=%s after valid retry, want 2", gotTXID)
@@ -561,6 +748,20 @@ func (r *activity160599BlockingReader) Read(p []byte) (int, error) {
 }
 
 func (*activity160599BlockingReader) Close() error { return nil }
+
+type activity160599ContextReader struct {
+	ctx     context.Context
+	entered chan<- struct{}
+	once    sync.Once
+}
+
+func (r *activity160599ContextReader) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.entered) })
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
+}
+
+func (*activity160599ContextReader) Close() error { return nil }
 
 func (*activity160599Client) Type() string                                          { return "activity160599" }
 func (*activity160599Client) Init(context.Context) error                            { return nil }
@@ -643,6 +844,37 @@ func activity160599RangeReader(data []byte, offset, size int64) (io.ReadCloser, 
 	return io.NopCloser(bytes.NewReader(data[offset:end])), nil
 }
 
+func activity160599BuildWAL(tb testing.TB, pageSize int, salt1, salt2 uint32, page []byte) []byte {
+	tb.Helper()
+	if len(page) != pageSize {
+		tb.Fatalf("WAL page size=%d, want %d", len(page), pageSize)
+	}
+	bo := binary.LittleEndian
+	wal := make([]byte, WALHeaderSize+WALFrameHeaderSize+pageSize)
+	header := wal[:WALHeaderSize]
+	binary.BigEndian.PutUint32(header[0:], 0x377f0682)
+	binary.BigEndian.PutUint32(header[4:], 3007000)
+	binary.BigEndian.PutUint32(header[8:], uint32(pageSize))
+	binary.BigEndian.PutUint32(header[12:], 1)
+	binary.BigEndian.PutUint32(header[16:], salt1)
+	binary.BigEndian.PutUint32(header[20:], salt2)
+	s0, s1 := WALChecksum(bo, 0, 0, header[:24])
+	binary.BigEndian.PutUint32(header[24:], s0)
+	binary.BigEndian.PutUint32(header[28:], s1)
+
+	frame := wal[WALHeaderSize : WALHeaderSize+WALFrameHeaderSize]
+	binary.BigEndian.PutUint32(frame[0:], 1)
+	binary.BigEndian.PutUint32(frame[4:], 1)
+	binary.BigEndian.PutUint32(frame[8:], salt1)
+	binary.BigEndian.PutUint32(frame[12:], salt2)
+	copy(wal[WALHeaderSize+WALFrameHeaderSize:], page)
+	s0, s1 = WALChecksum(bo, s0, s1, frame[:8])
+	s0, s1 = WALChecksum(bo, s0, s1, page)
+	binary.BigEndian.PutUint32(frame[16:], s0)
+	binary.BigEndian.PutUint32(frame[20:], s1)
+	return wal
+}
+
 func activity160599AssertNoArtifacts(tb testing.TB, output string) {
 	tb.Helper()
 	if _, err := os.Stat(output); !os.IsNotExist(err) {
@@ -659,6 +891,11 @@ func activity160599AssertNoArtifacts(tb testing.TB, output string) {
 		tb.Fatal(err)
 	} else if len(matches) != 0 {
 		tb.Fatalf("unique restore artifacts leaked: %v", matches)
+	}
+	for _, path := range []string{TXIDPath(output), TXIDPath(output) + ".tmp", output + "-shm", output + "-wal"} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			tb.Fatalf("restore side artifact leaked: path=%s err=%v", path, err)
+		}
 	}
 }
 

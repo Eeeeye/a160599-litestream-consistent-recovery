@@ -30,12 +30,7 @@ if ! timeout 90s /app/repro/run-all.sh > "$repro_log"; then
 fi
 cat "$repro_log"
 
-if ! awk '
-  BEGIN { n=0 }
-  /^\{"scenario":"[^"]+","ok":true,"txid":"[^"]*","detail":"[^"]*"\}$/ { n++; next }
-  { exit 1 }
-  END { if (n < 3) exit 1 }
-' "$repro_log"; then
+if ! timeout 30s go run /tests/validate_repro.go "$repro_log"; then
   echo "reproducer emitted an invalid schema or a failing scenario" >&2
   exit 1
 fi
