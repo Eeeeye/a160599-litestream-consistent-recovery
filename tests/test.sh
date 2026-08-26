@@ -23,6 +23,10 @@ if ! timeout 180s go test -count=1 -run '^TestActivity160599' . ./internal; then
   exit 1
 fi
 
+if ! timeout 240s go test -race -count=1 -run '^TestActivity160599(ConcurrentRestoresPublishExactlyOnce|FollowerBatchIsAllOrNothing|FollowerCommitRecoveryIsIdentityChecked|InitialFollowPublicationRecoversMissingTXID|ResumableReader)' . ./internal; then
+  exit 1
+fi
+
 repro_log=/tmp/activity160599-repro.jsonl
 if ! timeout 90s /app/repro/run-all.sh > "$repro_log"; then
   cat "$repro_log"

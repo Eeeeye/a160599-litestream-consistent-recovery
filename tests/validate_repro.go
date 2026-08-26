@@ -19,6 +19,13 @@ func main() {
 	defer f.Close()
 
 	seen := make(map[string]struct{})
+	required := map[string]struct{}{
+		"resume_exact":            {},
+		"resume_budget":           {},
+		"retention_replan":        {},
+		"failure_cleanup":         {},
+		"initial_follow_recovery": {},
+	}
 	scanner := bufio.NewScanner(f)
 	for line := 1; scanner.Scan(); line++ {
 		var raw map[string]json.RawMessage
@@ -59,8 +66,13 @@ func main() {
 	if err := scanner.Err(); err != nil {
 		fatalf("read reproducer log: %v", err)
 	}
-	if len(seen) < 3 {
-		fatalf("reproducer emitted %d unique scenarios, want at least 3", len(seen))
+	if len(seen) != len(required) {
+		fatalf("reproducer emitted %d unique scenarios, want exactly %d", len(seen), len(required))
+	}
+	for scenario := range required {
+		if _, ok := seen[scenario]; !ok {
+			fatalf("reproducer is missing required scenario %q", scenario)
+		}
 	}
 }
 

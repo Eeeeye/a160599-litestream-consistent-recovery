@@ -1,6 +1,8 @@
---- a/db.go
-+++ b/db.go
-@@ -1363,7 +1362,0 @@
+diff --git src/db.go dst/db.go
+index fe1df40..149452b 100644
+--- src/db.go
++++ dst/db.go
+@@ -1363,7 +1362,0 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 -	// If the file length has not moved then the previous sync already reached
 -	// the end, so avoid reopening and parsing the WAL on every monitor tick.
 -	if info.offset == fi.Size() {
@@ -8,107 +10,663 @@
 -		return info, nil
 -	}
 -
---- a/replica.go
-+++ b/replica.go
-@@ -6,0 +7 @@
-+	"encoding/binary"
-@@ -615,2 +616 @@
--
--	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
-+	targetTXID := infos[len(infos)-1].MaxTXID
-@@ -618,2 +618,2 @@
--	rdrs := make([]io.Reader, 0, len(infos))
--	defer func() {
-+	var rdrs []io.Reader
-+	closeReaders := func() {
-@@ -625 +625,3 @@
--	}()
-+		rdrs = nil
+diff --git dst/follow_commit.go dst/follow_commit.go
+new file mode 100644
+index 0000000..c045ef5
+--- /dev/null
++++ dst/follow_commit.go
+@@ -0,0 +1,262 @@
++package litestream
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++
++	"github.com/superfly/ltx"
++
++	"github.com/benbjohnson/litestream/internal"
++)
++
++const followCommitRecordVersion = 1
++
++type followCommitRecord struct {
++	Version   int    `json:"version"`
++	FromTXID  string `json:"from_txid"`
++	ToTXID    string `json:"to_txid"`
++	Stage     string `json:"stage"`
++	OldSize   int64  `json:"old_size"`
++	OldSHA256 string `json:"old_sha256"`
++	NewSize   int64  `json:"new_size"`
++	NewSHA256 string `json:"new_sha256"`
++}
++
++var restorePathMutexes sync.Map
++
++func lockRestorePath(path string) func() {
++	absPath, err := filepath.Abs(path)
++	if err != nil {
++		absPath = filepath.Clean(path)
 +	}
-+	defer closeReaders()
-@@ -627,5 +629,21 @@
++	v, _ := restorePathMutexes.LoadOrStore(absPath, &sync.Mutex{})
++	mu := v.(*sync.Mutex)
++	mu.Lock()
++	return mu.Unlock
++}
++
++func followCommitPath(outputPath string) string { return outputPath + "-follow" }
++
++// commitFollowStaged durably publishes a staged database and its TXID. Since
++// two pathnames cannot be renamed atomically, a checksummed intent record lets
++// a later invocation distinguish an old generation from a published generation
++// whose TXID sidecar was not yet updated.
++func commitFollowStaged(outputPath, stagePath string, fromTXID, toTXID ltx.TXID) error {
++	if toTXID <= fromTXID {
++		return fmt.Errorf("invalid follow commit range: %s..%s", fromTXID, toTXID)
++	}
++
++	newSize, newSHA, err := fileIdentity(stagePath)
++	if err != nil {
++		return fmt.Errorf("identify staged follower: %w", err)
++	}
++
++	record := followCommitRecord{
++		Version:   followCommitRecordVersion,
++		FromTXID:  fromTXID.String(),
++		ToTXID:    toTXID.String(),
++		Stage:     filepath.Base(stagePath),
++		OldSize:   -1,
++		NewSize:   newSize,
++		NewSHA256: newSHA,
++	}
++	if _, statErr := os.Stat(outputPath); statErr == nil {
++		record.OldSize, record.OldSHA256, err = fileIdentity(outputPath)
++		if err != nil {
++			return fmt.Errorf("identify current follower: %w", err)
++		}
++	} else if !errors.Is(statErr, os.ErrNotExist) {
++		return fmt.Errorf("stat current follower: %w", statErr)
++	} else if fromTXID != 0 {
++		return fmt.Errorf("current follower missing for commit from txid %s", fromTXID)
++	}
++
++	if fromTXID != 0 {
++		currentTXID, err := ReadTXIDFile(outputPath)
++		if err != nil {
++			return err
++		}
++		if currentTXID != fromTXID {
++			return fmt.Errorf("stale follow commit: sidecar txid=%s, expected %s", currentTXID, fromTXID)
++		}
++	}
++
++	if err := writeFollowCommitRecord(outputPath, record); err != nil {
++		return err
++	}
++	if err := os.Rename(stagePath, outputPath); err != nil {
++		_ = removeFollowCommitRecord(outputPath)
++		return fmt.Errorf("publish follower generation: %w", err)
++	}
++	if err := internal.FsyncDir(filepath.Dir(outputPath)); err != nil {
++		return fmt.Errorf("sync follower directory after publish: %w", err)
++	}
++	if err := WriteTXIDFile(outputPath, toTXID); err != nil {
++		return fmt.Errorf("publish follower txid: %w", err)
++	}
++	if err := removeFollowCommitRecord(outputPath); err != nil {
++		return err
++	}
++	return nil
++}
++
++// recoverFollowCommit reconciles an interrupted database/TXID publication.
++// It rolls forward only when the visible database matches the recorded new
++// identity, rolls back an unpublished stage when the old identity is visible,
++// and otherwise fails closed.
++func recoverFollowCommit(outputPath string) (ltx.TXID, error) {
++	record, err := readFollowCommitRecord(outputPath)
++	if errors.Is(err, os.ErrNotExist) {
++		return ReadTXIDFile(outputPath)
++	} else if err != nil {
++		return 0, err
++	}
++
++	fromTXID, err := ltx.ParseTXID(record.FromTXID)
++	if err != nil {
++		return 0, fmt.Errorf("parse follow record from txid: %w", err)
++	}
++	toTXID, err := ltx.ParseTXID(record.ToTXID)
++	if err != nil {
++		return 0, fmt.Errorf("parse follow record to txid: %w", err)
++	}
++	if toTXID <= fromTXID {
++		return 0, fmt.Errorf("invalid follow record range: %s..%s", fromTXID, toTXID)
++	}
++
++	stagePath, err := followStagePath(outputPath, record.Stage)
++	if err != nil {
++		return 0, err
++	}
++	currentTXID, err := ReadTXIDFile(outputPath)
++	if err != nil {
++		return 0, err
++	}
++
++	visibleSize, visibleSHA, identityErr := fileIdentity(outputPath)
++	if identityErr == nil && visibleSize == record.NewSize && visibleSHA == record.NewSHA256 {
++		if currentTXID != fromTXID && currentTXID != toTXID {
++			return 0, fmt.Errorf("follow recovery sidecar txid=%s, expected %s or %s", currentTXID, fromTXID, toTXID)
++		}
++		if currentTXID != toTXID {
++			if err := WriteTXIDFile(outputPath, toTXID); err != nil {
++				return 0, fmt.Errorf("roll forward follower txid: %w", err)
++			}
++		}
++		_ = os.Remove(stagePath)
++		if err := removeFollowCommitRecord(outputPath); err != nil {
++			return 0, err
++		}
++		return toTXID, nil
++	}
++
++	oldVisible := identityErr == nil && record.OldSize >= 0 && visibleSize == record.OldSize && visibleSHA == record.OldSHA256
++	initialUnpublished := errors.Is(identityErr, os.ErrNotExist) && fromTXID == 0 && currentTXID == 0
++	if oldVisible || initialUnpublished {
++		if currentTXID != fromTXID {
++			return 0, fmt.Errorf("follow recovery old generation has sidecar txid=%s, expected %s", currentTXID, fromTXID)
++		}
++		_ = os.Remove(stagePath)
++		if err := removeFollowCommitRecord(outputPath); err != nil {
++			return 0, err
++		}
++		return fromTXID, nil
++	}
++
++	if identityErr != nil && !errors.Is(identityErr, os.ErrNotExist) {
++		return 0, fmt.Errorf("identify follower during recovery: %w", identityErr)
++	}
++	return 0, fmt.Errorf("cannot reconcile follow commit: visible database matches neither txid %s nor %s generation", fromTXID, toTXID)
++}
++
++func writeFollowCommitRecord(outputPath string, record followCommitRecord) error {
++	dir := filepath.Dir(outputPath)
++	tmp, err := os.CreateTemp(dir, "."+filepath.Base(outputPath)+"-follow-record-*")
++	if err != nil {
++		return fmt.Errorf("create follow record: %w", err)
++	}
++	tmpPath := tmp.Name()
++	defer func() {
++		_ = tmp.Close()
++		_ = os.Remove(tmpPath)
++	}()
++
++	enc := json.NewEncoder(tmp)
++	enc.SetEscapeHTML(false)
++	if err := enc.Encode(record); err != nil {
++		return fmt.Errorf("encode follow record: %w", err)
++	}
++	if err := tmp.Sync(); err != nil {
++		return fmt.Errorf("sync follow record: %w", err)
++	}
++	if err := tmp.Close(); err != nil {
++		return fmt.Errorf("close follow record: %w", err)
++	}
++	if err := os.Rename(tmpPath, followCommitPath(outputPath)); err != nil {
++		return fmt.Errorf("publish follow record: %w", err)
++	}
++	if err := internal.FsyncDir(dir); err != nil {
++		return fmt.Errorf("sync follow record directory: %w", err)
++	}
++	return nil
++}
++
++func readFollowCommitRecord(outputPath string) (followCommitRecord, error) {
++	var record followCommitRecord
++	data, err := os.ReadFile(followCommitPath(outputPath))
++	if err != nil {
++		return record, err
++	}
++	if err := json.Unmarshal(data, &record); err != nil {
++		return record, fmt.Errorf("decode follow record: %w", err)
++	}
++	if record.Version != followCommitRecordVersion {
++		return record, fmt.Errorf("unsupported follow record version: %d", record.Version)
++	}
++	if record.NewSize < 0 || len(record.NewSHA256) != sha256.Size*2 {
++		return record, fmt.Errorf("invalid follow record new identity")
++	}
++	return record, nil
++}
++
++func removeFollowCommitRecord(outputPath string) error {
++	if err := os.Remove(followCommitPath(outputPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
++		return fmt.Errorf("remove follow record: %w", err)
++	}
++	if err := internal.FsyncDir(filepath.Dir(outputPath)); err != nil {
++		return fmt.Errorf("sync follower directory after record removal: %w", err)
++	}
++	return nil
++}
++
++func followStagePath(outputPath, name string) (string, error) {
++	base := "." + filepath.Base(outputPath)
++	validPrefix := strings.HasPrefix(name, base+"-follow-") || strings.HasPrefix(name, base+"-restore-")
++	if name == "" || filepath.Base(name) != name || !validPrefix {
++		return "", fmt.Errorf("invalid follow record staging name %q", name)
++	}
++	return filepath.Join(filepath.Dir(outputPath), name), nil
++}
++
++func fileIdentity(path string) (int64, string, error) {
++	f, err := os.Open(path)
++	if err != nil {
++		return 0, "", err
++	}
++	defer f.Close()
++
++	h := sha256.New()
++	n, err := io.Copy(h, f)
++	if err != nil {
++		return 0, "", err
++	}
++	return n, hex.EncodeToString(h.Sum(nil)), nil
++}
+diff --git src/internal/internal.go dst/internal/internal.go
+index b7afddd..21a5558 100644
+--- src/internal/internal.go
++++ dst/internal/internal.go
+@@ -96,0 +97,13 @@ func CreateFile(filename string, fi os.FileInfo) (*os.File, error) {
++// FsyncDir persists directory-entry changes made by rename or remove.
++func FsyncDir(path string) error {
++	dir, err := os.Open(path)
++	if err != nil {
++		return err
++	}
++	if err := dir.Sync(); err != nil {
++		_ = dir.Close()
++		return err
++	}
++	return dir.Close()
++}
++
+diff --git src/internal/resumable_reader.go dst/internal/resumable_reader.go
+index 7921c82..c8dd754 100644
+--- src/internal/resumable_reader.go
++++ dst/internal/resumable_reader.go
+@@ -5,0 +6 @@ import (
++	"errors"
+@@ -8,0 +10 @@ import (
++	"os"
+@@ -38,9 +40,12 @@ type ResumableReader struct {
+-	ctx     context.Context
+-	client  LTXFileOpener
+-	level   int
+-	minTXID ltx.TXID
+-	maxTXID ltx.TXID
+-	size    int64 // expected total file size from FileInfo; 0 means unknown
+-	offset  int64
+-	rc      io.ReadCloser
+-	logger  *slog.Logger
++	ctx         context.Context
++	client      LTXFileOpener
++	level       int
++	minTXID     ltx.TXID
++	maxTXID     ltx.TXID
++	size        int64 // expected total file size from FileInfo; 0 means unknown
++	offset      int64
++	rc          io.ReadCloser
++	retryN      int
++	noProgressN int
++	err         error
++	logger      *slog.Logger
+@@ -66 +71,13 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
+-	for attempt := 0; attempt <= resumableReaderMaxRetries; attempt++ {
++	if r.err != nil {
++		return 0, r.err
++	}
++	if len(p) == 0 {
++		return 0, nil
++	}
++
++	for {
++		if err := r.ctx.Err(); err != nil {
++			r.err = err
++			return 0, r.err
++		}
++
+@@ -70,7 +87 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
+-			// Keep one byte of overlap so storage gateways that return short
+-			// ranges do not leave a gap between requests.
+-			resumeOffset := r.offset
+-			if resumeOffset > 0 {
+-				resumeOffset--
+-			}
+-			rc, err := r.client.OpenLTXFile(r.ctx, r.level, r.minTXID, r.maxTXID, resumeOffset, 0)
++			rc, err := r.client.OpenLTXFile(r.ctx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
+@@ -78 +89,11 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
+-				return 0, fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)
++				if errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || r.ctx.Err() != nil {
++					r.err = fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)
++					return 0, r.err
++				}
++				if retryErr := r.retry(fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)); retryErr != nil {
++					return 0, retryErr
++				}
++				r.logger.Debug("reopen ltx file failed, retrying",
++					"level", r.level, "min", r.minTXID, "max", r.maxTXID,
++					"offset", r.offset, "error", err, "attempt", r.retryN)
++				continue
+@@ -83,0 +105,4 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
++		if n < 0 || n > len(p) {
++			r.err = fmt.Errorf("invalid read count %d for buffer size %d", n, len(p))
++			return 0, r.err
++		}
+@@ -84,0 +110,16 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
++		if r.size > 0 && r.offset > r.size {
++			r.err = fmt.Errorf("ltx stream exceeded advertised size %d at offset %d", r.size, r.offset)
++			return n, r.err
++		}
++
++		if n == 0 && err == nil {
++			r.noProgressN++
++			if r.noProgressN > resumableReaderMaxRetries {
++				r.err = fmt.Errorf("ltx stream made no progress at offset %d: %w", r.offset, io.ErrNoProgress)
++				return 0, r.err
++			}
++			continue
++		}
++		if n > 0 {
++			r.noProgressN = 0
++		}
+@@ -97,2 +138,2 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
+-					"offset", r.offset, "size", r.size, "attempt", attempt+1)
+-				r.rc.Close()
++					"offset", r.offset, "size", r.size, "attempt", r.retryN+1)
++				r.closeCurrent()
+@@ -99,0 +141,3 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
++				if retryErr := r.retry(io.ErrUnexpectedEOF); retryErr != nil {
++					return n, retryErr
++				}
+@@ -114,2 +158,2 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
+-			"error", err, "offset", r.offset, "attempt", attempt+1)
+-		r.rc.Close()
++			"error", err, "offset", r.offset, "attempt", r.retryN+1)
++		r.closeCurrent()
+@@ -116,0 +161,3 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
++		if retryErr := r.retry(err); retryErr != nil {
++			return n, retryErr
++		}
+@@ -120 +166,0 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
+-		continue
+@@ -122,3 +167,0 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
+-
+-	return 0, fmt.Errorf("max retries exceeded reading ltx file (level=%d, min=%s, max=%s, offset=%d)",
+-		r.level, r.minTXID, r.maxTXID, r.offset)
+@@ -132,0 +176,25 @@ func (r *ResumableReader) Close() error {
++
++// Err returns the terminal read error, if any. This is also used by restore
++// orchestration to recover errors swallowed by an older compactor header path.
++func (r *ResumableReader) Err() error { return r.err }
++
++func (r *ResumableReader) closeCurrent() {
++	if r.rc == nil {
++		return
++	}
++	if err := r.rc.Close(); err != nil {
++		r.logger.Debug("close ltx file",
++			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
++			"offset", r.offset, "error", err)
++	}
++}
++
++func (r *ResumableReader) retry(err error) error {
++	r.retryN++
++	if r.retryN <= resumableReaderMaxRetries {
++		return nil
++	}
++	r.err = fmt.Errorf("max retries exceeded reading ltx file (level=%d, min=%s, max=%s, offset=%d): %w",
++		r.level, r.minTXID, r.maxTXID, r.offset, err)
++	return r.err
++}
+diff --git src/replica.go dst/replica.go
+index 270b45c..7003432 100644
+--- src/replica.go
++++ dst/replica.go
+@@ -6,0 +7 @@ import (
++	"encoding/binary"
+@@ -546,0 +548,6 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
++	// Serialize restore publication for a destination within this process. The
++	// destination is checked again after staging so a losing concurrent restore
++	// cannot overwrite the winner.
++	unlockPath := lockRestorePath(opt.OutputPath)
++	defer unlockPath()
++
+@@ -549,0 +557,4 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
++		recoveredTXID, recoverErr := recoverFollowCommit(opt.OutputPath)
++		if recoverErr != nil {
++			return fmt.Errorf("recover interrupted follow commit: %w", recoverErr)
++		}
+@@ -551,5 +562 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-			txid, readErr := ReadTXIDFile(opt.OutputPath)
+-			if readErr != nil {
+-				return fmt.Errorf("read txid file for crash recovery: %w", readErr)
+-			}
+-			if txid == 0 {
++			if recoveredTXID == 0 {
+@@ -577,2 +584,2 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-				if latestSnapshot.MinTXID > txid {
+-					return fmt.Errorf("cannot resume follow mode: saved TXID %s is behind the earliest snapshot (min TXID %s); replica history has been pruned -- delete %s and %s-txid to re-restore", txid, latestSnapshot.MinTXID, opt.OutputPath, opt.OutputPath)
++				if latestSnapshot.MinTXID > recoveredTXID {
++					return fmt.Errorf("cannot resume follow mode: saved TXID %s is behind the earliest snapshot (min TXID %s); replica history has been pruned -- delete %s and %s-txid to re-restore", recoveredTXID, latestSnapshot.MinTXID, opt.OutputPath, opt.OutputPath)
+@@ -580,2 +587,2 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-				if txid > latestSnapshot.MaxTXID {
+-					return fmt.Errorf("cannot resume follow mode: saved TXID %s is ahead of latest snapshot (max TXID %s); delete %s and %s-txid to re-restore", txid, latestSnapshot.MaxTXID, opt.OutputPath, opt.OutputPath)
++				if recoveredTXID > latestSnapshot.MaxTXID {
++					return fmt.Errorf("cannot resume follow mode: saved TXID %s is ahead of latest snapshot (max TXID %s); delete %s and %s-txid to re-restore", recoveredTXID, latestSnapshot.MaxTXID, opt.OutputPath, opt.OutputPath)
+@@ -585,2 +592,4 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-			r.Logger().Info("resuming follow mode from crash recovery", "txid", txid, "output", opt.OutputPath)
+-			return r.follow(ctx, opt.OutputPath, txid, opt.FollowInterval)
++			r.Logger().Info("resuming follow mode from crash recovery", "txid", recoveredTXID, "output", opt.OutputPath)
++			return r.follow(ctx, opt.OutputPath, recoveredTXID, opt.FollowInterval)
++		} else if !errors.Is(statErr, os.ErrNotExist) {
++			return statErr
+@@ -614,0 +624 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
++	targetTXID := infos[len(infos)-1].MaxTXID
+@@ -616 +626,8 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
++	// Create parent directory if it doesn't exist.
++	var dirInfo os.FileInfo
++	if db := r.DB(); db != nil {
++		dirInfo = db.dirInfo
++	}
++	if err := internal.MkdirAll(filepath.Dir(opt.OutputPath), dirInfo); err != nil {
++		return fmt.Errorf("create parent directory: %w", err)
++	}
+@@ -618 +635,19 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-	rdrs := make([]io.Reader, 0, len(infos))
++	// A retained object can disappear after it is opened or during a ranged
++	// resume, not just during the first OpenLTXFile call. Retry the complete
++	// stage operation with a fresh plan while keeping the original target fixed.
++	const maxRestorePlanAttempts = 4
++	var tmpOutputPath string
++	for attempt := 1; attempt <= maxRestorePlanAttempts; attempt++ {
++		r.Logger().Debug("restore plan", "attempt", attempt, "n", len(infos), "txid", targetTXID)
++		tmpOutputPath, err = r.stageRestorePlan(ctx, opt.OutputPath, infos)
++		if err == nil {
++			break
++		}
++		if !errors.Is(err, os.ErrNotExist) || attempt == maxRestorePlanAttempts {
++			return err
++		}
++		infos, err = CalcRestorePlan(ctx, r.Client, targetTXID, time.Time{}, r.Logger())
++		if err != nil {
++			return fmt.Errorf("cannot replan restore to txid %s: %w", targetTXID, err)
++		}
++	}
+@@ -620,4 +655,2 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-		for _, rd := range rdrs {
+-			if closer, ok := rd.(io.Closer); ok {
+-				_ = closer.Close()
+-			}
++		if tmpOutputPath == "" {
++			return
+@@ -624,0 +658,3 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
++		_ = os.Remove(tmpOutputPath)
++		_ = os.Remove(tmpOutputPath + "-shm")
++		_ = os.Remove(tmpOutputPath + "-wal")
+@@ -627,5 +663,4 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 -	for _, info := range infos {
 -		// Validate file size - must be at least header size to be readable
 -		if info.Size < ltx.HeaderSize {
 -			return fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
 -				info.Level, info.MinTXID, info.MaxTXID, info.Size, ltx.HeaderSize)
-+	const maxRestorePlanAttempts = 3
-+	for attempt := 1; attempt <= maxRestorePlanAttempts; attempt++ {
-+		r.Logger().Debug("restore plan", "attempt", attempt, "n", len(infos), "txid", targetTXID)
-+		rdrs = make([]io.Reader, 0, len(infos))
-+
-+		var openErr error
-+		for _, info := range infos {
-+			// Validate file size - must be at least header size to be readable.
-+			if info.Size < ltx.HeaderSize {
-+				openErr = fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
-+					info.Level, info.MinTXID, info.MaxTXID, info.Size, ltx.HeaderSize)
-+				break
-+			}
-+
-+			r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
-+			f, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
-+			if err != nil {
-+				openErr = fmt.Errorf("open ltx file: %w", err)
-+				break
-+			}
-+			rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, r.Logger()))
-@@ -634 +652,3 @@
--		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
-+		if openErr == nil {
-+			break
-+		}
-@@ -636,2 +656,9 @@
--		// Add file to be compacted.
--		f, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
-+		closeReaders()
-+		if !errors.Is(openErr, os.ErrNotExist) || attempt == maxRestorePlanAttempts {
-+			return openErr
-+		}
-+
-+		// Retention can remove a planned file between listing and opening. Make
-+		// a fresh plan, but freeze the target selected by the first plan so a
-+		// retry cannot silently move to a newer transaction.
-+		infos, err = CalcRestorePlan(ctx, r.Client, targetTXID, time.Time{}, r.Logger())
-@@ -639 +666 @@
--			return fmt.Errorf("open ltx file: %w", err)
-+			return fmt.Errorf("cannot replan restore to txid %s: %w", targetTXID, err)
-@@ -641 +667,0 @@
--		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, r.Logger()))
-@@ -657,5 +683,4 @@
--	// Output to temp file & atomically rename.
--	tmpOutputPath := opt.OutputPath + ".tmp"
--	r.Logger().Debug("compacting into database", "path", tmpOutputPath, "n", len(rdrs))
--
--	f, err := os.Create(tmpOutputPath)
-+	// Build into a unique file in the destination directory. Keeping the
-+	// staging file on the same filesystem makes the final rename atomic and
-+	// avoids collisions between concurrent restores.
-+	f, err := os.CreateTemp(filepath.Dir(opt.OutputPath), "."+filepath.Base(opt.OutputPath)+"-restore-*")
-@@ -665 +690,8 @@
--	defer func() { _ = f.Close() }()
-+	tmpOutputPath := f.Name()
-+	r.Logger().Debug("compacting into database", "path", tmpOutputPath, "n", len(rdrs))
-+	defer func() {
-+		_ = f.Close()
-+		_ = os.Remove(tmpOutputPath)
-+		_ = os.Remove(tmpOutputPath + "-shm")
-+		_ = os.Remove(tmpOutputPath + "-wal")
-+	}()
-@@ -667,0 +700 @@
-+	defer pr.Close()
-@@ -690 +723,9 @@
--	// Copy file to final location.
 +	// Validate the complete staged database before publishing its pathname.
 +	if opt.IntegrityCheck != IntegrityCheckNone {
 +		if err := checkIntegrity(ctx, tmpOutputPath, opt.IntegrityCheck); err != nil {
 +			return fmt.Errorf("pre-publish restore integrity check: %w", err)
-+		}
+@@ -632,0 +668,2 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 +		r.Logger().Info("pre-publish restore integrity check passed")
 +	}
-+
-+	// Publish and persist the directory entry.
-@@ -695,11 +736,3 @@
+@@ -634 +671,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
++	// A second restore may have won while this invocation was staging. Never
++	// clobber its published database.
++	if _, statErr := os.Stat(opt.OutputPath); statErr == nil {
++		return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
++	} else if !errors.Is(statErr, os.ErrNotExist) {
++		return statErr
++	}
+@@ -636,4 +679,12 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-		// Add file to be compacted.
+-		f, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+-		if err != nil {
+-			return fmt.Errorf("open ltx file: %w", err)
++	maxTXID := infos[len(infos)-1].MaxTXID
++	if opt.Follow {
++		if err := commitFollowStaged(opt.OutputPath, tmpOutputPath, 0, maxTXID); err != nil {
++			return fmt.Errorf("publish initial follow generation: %w", err)
++		}
++	} else {
++		r.Logger().Debug("renaming database from temporary location")
++		if err := os.Rename(tmpOutputPath, opt.OutputPath); err != nil {
++			return err
++		}
++		if err := internal.FsyncDir(filepath.Dir(opt.OutputPath)); err != nil {
++			return fmt.Errorf("sync restore output dir: %w", err)
+@@ -641 +691,0 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, r.Logger()))
+@@ -642,0 +693 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
++	tmpOutputPath = ""
+@@ -644,2 +695,3 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-	if len(rdrs) == 0 {
+-		return fmt.Errorf("no matching backup files available")
++	// Enter follow mode after the initial database and TXID are durably paired.
++	if opt.Follow {
++		return r.follow(ctx, opt.OutputPath, maxTXID, opt.FollowInterval)
+@@ -646,0 +699,2 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
++	return nil
++}
+@@ -648,7 +702,6 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-	// Create parent directory if it doesn't exist.
+-	var dirInfo os.FileInfo
+-	if db := r.DB(); db != nil {
+-		dirInfo = db.dirInfo
+-	}
+-	if err := internal.MkdirAll(filepath.Dir(opt.OutputPath), dirInfo); err != nil {
+-		return fmt.Errorf("create parent directory: %w", err)
++// stageRestorePlan compacts one immutable plan into a unique same-directory
++// file. Readers open lazily so transient provider failures and retention races
++// during a ranged resume flow through the same bounded retry/replan path.
++func (r *Replica) stageRestorePlan(ctx context.Context, outputPath string, infos []*ltx.FileInfo) (_ string, retErr error) {
++	if len(infos) == 0 {
++		return "", fmt.Errorf("no matching backup files available")
+@@ -657,3 +710,15 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-	// Output to temp file & atomically rename.
+-	tmpOutputPath := opt.OutputPath + ".tmp"
+-	r.Logger().Debug("compacting into database", "path", tmpOutputPath, "n", len(rdrs))
++	rdrs := make([]io.Reader, 0, len(infos))
++	defer func() {
++		for _, rd := range rdrs {
++			if closer, ok := rd.(io.Closer); ok {
++				_ = closer.Close()
++			}
++		}
++	}()
++	for _, info := range infos {
++		if info.Size < ltx.HeaderSize {
++			return "", fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
++				info.Level, info.MinTXID, info.MaxTXID, info.Size, ltx.HeaderSize)
++		}
++		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger()))
++	}
+@@ -661 +726 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-	f, err := os.Create(tmpOutputPath)
++	f, err := os.CreateTemp(filepath.Dir(outputPath), "."+filepath.Base(outputPath)+"-restore-*")
+@@ -663 +728 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-		return fmt.Errorf("create temp database path: %w", err)
++		return "", fmt.Errorf("create temp database path: %w", err)
+@@ -665 +730,10 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-	defer func() { _ = f.Close() }()
++	tmpPath := f.Name()
++	keep := false
++	defer func() {
++		_ = f.Close()
++		if !keep {
++			_ = os.Remove(tmpPath)
++			_ = os.Remove(tmpPath + "-shm")
++			_ = os.Remove(tmpPath + "-wal")
++		}
++	}()
+@@ -668 +742 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-
++	done := make(chan error, 1)
+@@ -671,3 +745,3 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-		if err != nil {
+-			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
+-			return
++		if err == nil {
++			c.HeaderFlags = ltx.HeaderFlagNoChecksum
++			err = c.Compact(ctx)
+@@ -675,2 +749,2 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-		c.HeaderFlags = ltx.HeaderFlagNoChecksum
+-		_ = pw.CloseWithError(c.Compact(ctx))
++		_ = pw.CloseWithError(err)
++		done <- err
+@@ -680,2 +754,5 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-	if err := dec.DecodeDatabaseTo(f); err != nil {
+-		return fmt.Errorf("decode database: %w", err)
++	decodeErr := dec.DecodeDatabaseTo(f)
++	if decodeErr != nil {
++		_ = pr.CloseWithError(decodeErr)
++	} else {
++		_ = pr.Close()
+@@ -683,5 +760,5 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-
+-	if err := f.Sync(); err != nil {
+-		return err
+-	} else if err := f.Close(); err != nil {
+-		return err
++	compactErr := <-done
++	for _, rd := range rdrs {
++		if rr, ok := rd.(*internal.ResumableReader); ok && rr.Err() != nil {
++			return "", fmt.Errorf("read restore plan: %w", rr.Err())
++		}
+@@ -689,5 +766,2 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-
+-	// Copy file to final location.
+-	r.Logger().Debug("renaming database from temporary location")
+-	if err := os.Rename(tmpOutputPath, opt.OutputPath); err != nil {
+-		return err
++	if compactErr != nil && !errors.Is(compactErr, io.ErrClosedPipe) {
++		return "", fmt.Errorf("compact restore plan: %w", compactErr)
+@@ -695,11 +769,2 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 -
 -	if opt.IntegrityCheck != IntegrityCheckNone {
 -		if err := checkIntegrity(ctx, opt.OutputPath, opt.IntegrityCheck); err != nil {
@@ -120,18 +678,135 @@
 -			return fmt.Errorf("post-restore integrity check: %w", err)
 -		}
 -		r.Logger().Info("post-restore integrity check passed")
-+	dir, err := os.Open(filepath.Dir(opt.OutputPath))
++	if decodeErr != nil {
++		return "", fmt.Errorf("decode database: %w", decodeErr)
+@@ -707,15 +772,2 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-
+-	// Enter follow mode if enabled, continuously applying new LTX files.
+-	if opt.Follow {
+-		for _, rd := range rdrs {
+-			if closer, ok := rd.(io.Closer); ok {
+-				_ = closer.Close()
+-			}
+-		}
+-		rdrs = nil
+-
+-		maxTXID := infos[len(infos)-1].MaxTXID
+-		if err := WriteTXIDFile(opt.OutputPath, maxTXID); err != nil {
+-			return fmt.Errorf("write initial txid file: %w", err)
+-		}
+-		return r.follow(ctx, opt.OutputPath, maxTXID, opt.FollowInterval)
++	if compactErr != nil {
++		return "", fmt.Errorf("compact restore plan: %w", compactErr)
+@@ -723,2 +775,8 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+-
+-	return nil
++	if err := f.Sync(); err != nil {
++		return "", fmt.Errorf("sync staged database: %w", err)
++	}
++	if err := f.Close(); err != nil {
++		return "", fmt.Errorf("close staged database: %w", err)
++	}
++	keep = true
++	return tmpPath, nil
+@@ -777,2 +835,9 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
+-				if err := WriteTXIDFile(outputPath, newTXID); err != nil {
+-					return fmt.Errorf("write txid file: %w", err)
++				// Batch publication replaces the pathname. Reopen it so the next
++				// poll is based on the newly committed inode rather than the old
++				// descriptor retained across the rename.
++				if err := f.Close(); err != nil {
++					return fmt.Errorf("close previous follower generation: %w", err)
++				}
++				f, err = os.OpenFile(outputPath, os.O_RDWR, 0)
++				if err != nil {
++					return fmt.Errorf("reopen published follower generation: %w", err)
+@@ -788,3 +853,3 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
+-// applyNewLTXFiles polls for new LTX files and applies them to the database.
+-// It starts from level 0 and falls back to higher levels if there are gaps
+-// (e.g., level 0 files were compacted away).
++// applyNewLTXFiles stages a complete polling batch against a copy of the
++// follower. The visible path and TXID sidecar are updated only after every LTX
++// in the batch has decoded, validated, and synced successfully.
+@@ -791,0 +857,77 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
++	outputPath := f.Name()
++	recoveredTXID, err := recoverFollowCommit(outputPath)
 +	if err != nil {
-+		return fmt.Errorf("open restore directory: %w", err)
-@@ -706,0 +740,7 @@
-+	if err := dir.Sync(); err != nil {
-+		_ = dir.Close()
-+		return fmt.Errorf("sync restore directory: %w", err)
++		return afterTXID, fmt.Errorf("recover previous follow commit: %w", err)
 +	}
-+	if err := dir.Close(); err != nil {
-+		return fmt.Errorf("close restore directory: %w", err)
++	if recoveredTXID < afterTXID {
++		return afterTXID, fmt.Errorf("follower sidecar txid %s is behind caller txid %s", recoveredTXID, afterTXID)
 +	}
-@@ -886,2 +926,5 @@
++	if recoveredTXID > afterTXID {
++		afterTXID = recoveredTXID
++	}
++
++	source, err := os.OpenFile(outputPath, os.O_RDWR, 0)
++	if err != nil {
++		return afterTXID, fmt.Errorf("open current follower generation: %w", err)
++	}
++	defer source.Close()
++	if err := internal.LockFileExclusive(source); err != nil {
++		return afterTXID, fmt.Errorf("lock current follower generation: %w", err)
++	}
++	locked := true
++	defer func() {
++		if locked {
++			_ = internal.UnlockFile(source)
++		}
++	}()
++
++	info, err := source.Stat()
++	if err != nil {
++		return afterTXID, fmt.Errorf("stat current follower generation: %w", err)
++	}
++	stage, err := os.CreateTemp(filepath.Dir(outputPath), "."+filepath.Base(outputPath)+"-follow-*")
++	if err != nil {
++		return afterTXID, fmt.Errorf("create follow batch stage: %w", err)
++	}
++	stagePath := stage.Name()
++	defer func() {
++		_ = stage.Close()
++		_ = os.Remove(stagePath)
++	}()
++	if err := stage.Chmod(info.Mode()); err != nil {
++		return afterTXID, fmt.Errorf("set follow batch stage mode: %w", err)
++	}
++	if _, err := source.Seek(0, io.SeekStart); err != nil {
++		return afterTXID, fmt.Errorf("rewind follower generation: %w", err)
++	}
++	if _, err := io.Copy(stage, source); err != nil {
++		return afterTXID, fmt.Errorf("copy follower generation: %w", err)
++	}
++	if err := internal.UnlockFile(source); err != nil {
++		return afterTXID, fmt.Errorf("unlock current follower generation: %w", err)
++	}
++	locked = false
++
++	currentTXID, err := r.applyNewLTXFilesTo(ctx, stage, afterTXID, pageSize)
++	if err != nil {
++		return afterTXID, err
++	}
++	if currentTXID == afterTXID {
++		return afterTXID, nil
++	}
++	if err := stage.Sync(); err != nil {
++		return afterTXID, fmt.Errorf("sync follow batch stage: %w", err)
++	}
++	if err := stage.Close(); err != nil {
++		return afterTXID, fmt.Errorf("close follow batch stage: %w", err)
++	}
++	if err := commitFollowStaged(outputPath, stagePath, afterTXID, currentTXID); err != nil {
++		return afterTXID, err
++	}
++	return currentTXID, nil
++}
++
++// applyNewLTXFilesTo applies a poll result to an unpublished staging file. It
++// starts from level 0 and falls back to higher levels when retention has
++// compacted away an incremental range.
++func (r *Replica) applyNewLTXFilesTo(ctx context.Context, f *os.File, afterTXID ltx.TXID, pageSize uint32) (ltx.TXID, error) {
+@@ -886,2 +1028,5 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 -	if err := internal.LockFileExclusive(f); err != nil {
 -		return fmt.Errorf("acquire exclusive lock: %w", err)
 +	// Fully decode and validate the incoming object before touching the
@@ -139,20 +814,19 @@
 +	stage, err := os.CreateTemp(filepath.Dir(f.Name()), ".litestream-follow-*")
 +	if err != nil {
 +		return fmt.Errorf("create follow staging file: %w", err)
-@@ -889 +932,5 @@
+@@ -889 +1034,5 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 -	defer internal.UnlockFile(f)
 +	stagePath := stage.Name()
 +	defer func() {
 +		_ = stage.Close()
 +		_ = os.Remove(stagePath)
 +	}()
-@@ -890,0 +938,2 @@
+@@ -890,0 +1040,2 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 +	data := make([]byte, pageSize)
 +	var recordHeader [4]byte
-@@ -893 +941,0 @@
+@@ -893 +1043,0 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 -		data := make([]byte, pageSize)
-@@ -897,0 +946,10 @@
-+		}
+@@ -898,0 +1049,26 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 +		if err := ctx.Err(); err != nil {
 +			return err
 +		}
@@ -162,10 +836,9 @@
 +		}
 +		if _, err := stage.Write(data); err != nil {
 +			return fmt.Errorf("stage page %d: %w", phdr.Pgno, err)
-@@ -898,0 +957 @@
++		}
 +	}
-@@ -900 +959,29 @@
--		if phdr.Pgno == 1 && len(data) >= 28 {
++
 +	if err := dec.Close(); err != nil {
 +		return fmt.Errorf("close decoder: %w", err)
 +	}
@@ -180,7 +853,8 @@
 +		return fmt.Errorf("acquire exclusive lock: %w", err)
 +	}
 +	defer internal.UnlockFile(f)
-+
+@@ -900 +1076,14 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
+-		if phdr.Pgno == 1 && len(data) >= 28 {
 +	for {
 +		if _, err := io.ReadFull(stage, recordHeader[:]); err == io.EOF {
 +			break
@@ -195,26 +869,19 @@
 +			return err
 +		}
 +		if pgno == 1 && len(data) >= 28 {
-@@ -904,2 +991 @@
+@@ -904,2 +1093 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 -
 -		off := int64(phdr.Pgno-1) * int64(pageSize)
 +		off := int64(pgno-1) * int64(pageSize)
-@@ -907 +993 @@
+@@ -907 +1095 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 -			return fmt.Errorf("write page %d: %w", phdr.Pgno, err)
 +			return fmt.Errorf("write page %d: %w", pgno, err)
-@@ -918,4 +1003,0 @@
+@@ -911,0 +1100,3 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
++		if err := f.Sync(); err != nil {
++			return fmt.Errorf("sync before truncate: %w", err)
++		}
+@@ -918,4 +1108,0 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 -	if err := dec.Close(); err != nil {
 -		return fmt.Errorf("close decoder: %w", err)
 -	}
 -
---- a/internal/resumable_reader.go
-+++ b/internal/resumable_reader.go
-@@ -70,7 +70 @@
--			// Keep one byte of overlap so storage gateways that return short
--			// ranges do not leave a gap between requests.
--			resumeOffset := r.offset
--			if resumeOffset > 0 {
--				resumeOffset--
--			}
--			rc, err := r.client.OpenLTXFile(r.ctx, r.level, r.minTXID, r.maxTXID, resumeOffset, 0)
-+			rc, err := r.client.OpenLTXFile(r.ctx, r.level, r.minTXID, r.maxTXID, r.offset, 0)

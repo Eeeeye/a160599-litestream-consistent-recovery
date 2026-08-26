@@ -26,7 +26,13 @@ type result struct {
 }
 
 func main() {
-	results := []result{runExactResume(), runRetentionReplan(), runFailureCleanup()}
+	results := []result{
+		runExactResume(),
+		runBoundedResume(),
+		runRetentionReplan(),
+		runFailureCleanup(),
+		runInitialFollowRecovery(),
+	}
 	ok := true
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetEscapeHTML(false)
@@ -39,6 +45,23 @@ func main() {
 	if !ok {
 		os.Exit(1)
 	}
+}
+
+func runBoundedResume() result {
+	data := bytes.Repeat([]byte("broken-range-"), 8)
+	opener := &oneByteFaultOpener{data: data}
+	r := internal.NewResumableReader(
+		context.Background(), opener, 0, 7, 7, int64(len(data)),
+		&oneFaultReader{data: data, cut: 1},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	got, err := io.ReadAll(r)
+	ok := errors.Is(err, io.ErrUnexpectedEOF) && len(got) == 4 && len(opener.offsets) == 3
+	detail := "retry budget stayed bounded across partial-read calls"
+	if !ok {
+		detail = fmt.Sprintf("err=%v bytes=%d offsets=%v", err, len(got), opener.offsets)
+	}
+	return result{Scenario: "resume_budget", OK: ok, TXID: "7", Detail: detail}
 }
 
 func runExactResume() result {
@@ -82,16 +105,17 @@ func runRetentionReplan() result {
 		return nil
 	}
 	c.open = func(level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
-		c.mu.Lock()
-		if level == 0 && minTXID == 2 && !c.deleted {
-			c.deleted = true
-			c.mu.Unlock()
-			return nil, fmt.Errorf("retained object disappeared: %w", os.ErrNotExist)
-		}
-		c.mu.Unlock()
 		switch {
 		case level == litestream.SnapshotLevel && minTXID == 1:
 			return sliceReader(snapData, offset, size)
+		case level == 0 && minTXID == 2:
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if offset == 0 && !c.deleted {
+				return &oneFaultReader{data: incData, cut: ltx.HeaderSize + 37}, nil
+			}
+			c.deleted = true
+			return nil, fmt.Errorf("retained range disappeared: %w", os.ErrNotExist)
 		case level == 1 && minTXID == 2:
 			return sliceReader(incData, offset, size)
 		default:
@@ -110,6 +134,44 @@ func runRetentionReplan() result {
 		detail = fmt.Sprintf("restore=%v read=%v size=%d", err, readErr, len(got))
 	}
 	return result{Scenario: "retention_replan", OK: ok, TXID: "2", Detail: detail}
+}
+
+func runInitialFollowRecovery() result {
+	const pageSize = 4096
+	page := bytes.Repeat([]byte{0x45}, pageSize)
+	page[16], page[17] = 0x10, 0x00
+	snapshotData := buildLTX(1, 1, page)
+	info := &ltx.FileInfo{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 1, Size: int64(len(snapshotData))}
+	c := &replicaClient{
+		files: func(level int) []*ltx.FileInfo {
+			if level == litestream.SnapshotLevel {
+				return []*ltx.FileInfo{info}
+			}
+			return nil
+		},
+		open: func(_ int, _, _ ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			return sliceReader(snapshotData, offset, size)
+		},
+	}
+	dir, _ := os.MkdirTemp("", "litestream-repro-")
+	defer os.RemoveAll(dir)
+	output := filepath.Join(dir, "follow.db")
+	blocker := litestream.TXIDPath(output) + ".tmp"
+	_ = os.Mkdir(blocker, 0o700)
+	r := litestream.NewReplicaWithClient(nil, c)
+	firstErr := r.Restore(context.Background(), litestream.RestoreOptions{OutputPath: output, Follow: true, FollowInterval: time.Millisecond})
+	_ = os.Remove(blocker)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	restartErr := r.Restore(ctx, litestream.RestoreOptions{OutputPath: output, Follow: true, FollowInterval: time.Millisecond})
+	txid, txidErr := litestream.ReadTXIDFile(output)
+	_, markerErr := os.Stat(output + "-follow")
+	ok := firstErr != nil && restartErr == nil && txidErr == nil && txid == 1 && errors.Is(markerErr, os.ErrNotExist)
+	detail := "restart reconciled the published database with its TXID"
+	if !ok {
+		detail = fmt.Sprintf("first=%v restart=%v txid=%s txid_err=%v marker=%v", firstErr, restartErr, txid, txidErr, markerErr)
+	}
+	return result{Scenario: "initial_follow_recovery", OK: ok, TXID: txid.String(), Detail: detail}
 }
 
 func runFailureCleanup() result {
@@ -174,6 +236,19 @@ type rangeClient struct {
 	offsets []int64
 }
 
+type oneByteFaultOpener struct {
+	data    []byte
+	offsets []int64
+}
+
+func (c *oneByteFaultOpener) OpenLTXFile(_ context.Context, _ int, _, _ ltx.TXID, offset, _ int64) (io.ReadCloser, error) {
+	c.offsets = append(c.offsets, offset)
+	if offset < 0 || offset >= int64(len(c.data)) {
+		return &oneFaultReader{}, nil
+	}
+	return &oneFaultReader{data: c.data[offset:], cut: 1}, nil
+}
+
 func (c *rangeClient) OpenLTXFile(_ context.Context, _ int, _, _ ltx.TXID, offset, size int64) (io.ReadCloser, error) {
 	c.offsets = append(c.offsets, offset)
 	return sliceReader(c.data, offset, size)
@@ -186,10 +261,10 @@ type replicaClient struct {
 	open    func(level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error)
 }
 
-func (*replicaClient) Type() string               { return "repro" }
-func (*replicaClient) Init(context.Context) error { return nil }
-func (*replicaClient) SetLogger(*slog.Logger)     {}
-func (*replicaClient) DeleteAll(context.Context) error { return nil }
+func (*replicaClient) Type() string                                          { return "repro" }
+func (*replicaClient) Init(context.Context) error                            { return nil }
+func (*replicaClient) SetLogger(*slog.Logger)                                {}
+func (*replicaClient) DeleteAll(context.Context) error                       { return nil }
 func (*replicaClient) DeleteLTXFiles(context.Context, []*ltx.FileInfo) error { return nil }
 func (*replicaClient) WriteLTXFile(context.Context, int, ltx.TXID, ltx.TXID, io.Reader) (*ltx.FileInfo, error) {
 	return nil, errors.New("unexpected write")
