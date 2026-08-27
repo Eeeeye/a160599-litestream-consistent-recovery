@@ -3,7 +3,9 @@ package litestream
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -909,7 +911,8 @@ func TestActivity160599FollowerCommitRecoveryIsIdentityChecked(t *testing.T) {
 			}
 
 			path := filepath.Join(t.TempDir(), "recover.db")
-			if err := os.WriteFile(path, bytes.Repeat([]byte{0x25}, pageSize), 0o600); err != nil {
+			oldGeneration := bytes.Repeat([]byte{0x25}, pageSize)
+			if err := os.WriteFile(path, oldGeneration, 0o600); err != nil {
 				t.Fatal(err)
 			}
 			if err := WriteTXIDFile(path, 1); err != nil {
@@ -945,6 +948,19 @@ func TestActivity160599FollowerCommitRecoveryIsIdentityChecked(t *testing.T) {
 			}
 			if _, err := os.Stat(path + "-follow"); err != nil {
 				t.Fatalf("durable recovery record missing: %v", err)
+			}
+			record := activity160599ReadFollowRecord(t, path)
+			oldSHA := sha256.Sum256(oldGeneration)
+			newSHA := sha256.Sum256(visible)
+			if record.Version != 1 || record.FromTXID != "0000000000000001" || record.ToTXID != "0000000000000002" {
+				t.Fatalf("follow record version/range=%+v, want v1 1..2", record)
+			}
+			if record.OldSize != pageSize || record.NewSize != pageSize || record.OldSHA256 != fmt.Sprintf("%x", oldSHA) || record.NewSHA256 != fmt.Sprintf("%x", newSHA) {
+				t.Fatalf("follow record identities=%+v, want exact old/new size and SHA-256", record)
+			}
+			stagePrefix := "." + filepath.Base(path) + "-follow-"
+			if filepath.Base(record.Stage) != record.Stage || !strings.HasPrefix(record.Stage, stagePrefix) {
+				t.Fatalf("follow record stage=%q, want basename with prefix %q", record.Stage, stagePrefix)
 			}
 
 			if tc.tamper {
@@ -1019,6 +1035,22 @@ func TestActivity160599InitialFollowPublicationRecoversMissingTXID(t *testing.T)
 	if _, statErr := os.Stat(path + "-follow"); statErr != nil {
 		t.Fatalf("initial recovery record missing: %v", statErr)
 	}
+	record := activity160599ReadFollowRecord(t, path)
+	visible, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	newSHA := sha256.Sum256(visible)
+	if record.Version != 1 || record.FromTXID != "0000000000000000" || record.ToTXID != "0000000000000001" {
+		t.Fatalf("initial follow record version/range=%+v, want v1 0..1", record)
+	}
+	if record.OldSize != -1 || record.OldSHA256 != "" || record.NewSize != int64(len(visible)) || record.NewSHA256 != fmt.Sprintf("%x", newSHA) {
+		t.Fatalf("initial follow record identities=%+v, want absent old and exact new identity", record)
+	}
+	stagePrefix := "." + filepath.Base(path) + "-restore-"
+	if filepath.Base(record.Stage) != record.Stage || !strings.HasPrefix(record.Stage, stagePrefix) {
+		t.Fatalf("initial follow stage=%q, want basename with prefix %q", record.Stage, stagePrefix)
+	}
 	if err := os.Remove(blocker); err != nil {
 		t.Fatal(err)
 	}
@@ -1040,6 +1072,42 @@ type activity160599Client struct {
 	listCalls int
 	files     func(level int) []*ltx.FileInfo
 	open      func(level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error)
+}
+
+type activity160599FollowRecord struct {
+	Version   int    `json:"version"`
+	FromTXID  string `json:"from_txid"`
+	ToTXID    string `json:"to_txid"`
+	Stage     string `json:"stage"`
+	OldSize   int64  `json:"old_size"`
+	OldSHA256 string `json:"old_sha256"`
+	NewSize   int64  `json:"new_size"`
+	NewSHA256 string `json:"new_sha256"`
+}
+
+func activity160599ReadFollowRecord(tb testing.TB, output string) activity160599FollowRecord {
+	tb.Helper()
+	data, err := os.ReadFile(output + "-follow")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		tb.Fatalf("decode follow record JSON: %v", err)
+	}
+	if len(raw) != 8 {
+		tb.Fatalf("follow record has %d fields, want exactly 8", len(raw))
+	}
+	for _, key := range []string{"version", "from_txid", "to_txid", "stage", "old_size", "old_sha256", "new_size", "new_sha256"} {
+		if _, ok := raw[key]; !ok {
+			tb.Fatalf("follow record missing field %q", key)
+		}
+	}
+	var record activity160599FollowRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		tb.Fatalf("decode typed follow record: %v", err)
+	}
+	return record
 }
 
 type activity160599ErrorReader struct {
