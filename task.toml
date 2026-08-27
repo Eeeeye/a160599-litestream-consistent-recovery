@@ -6,7 +6,7 @@ description = "Repair crash-consistent Litestream generations across mutable WAL
 keywords = ["go", "sqlite", "litestream", "wal", "ltx", "atomicity", "judge-grading"]
 
 [metadata]
-difficulty = "hard"
+difficulty = "expert"
 category = "programming"
 tags = ["l4", "disaster-recovery", "crash-consistency", "concurrency", "storage", "fault-injection"]
 

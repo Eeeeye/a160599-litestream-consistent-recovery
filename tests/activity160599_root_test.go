@@ -1200,7 +1200,7 @@ func activity160599BuildWAL(tb testing.TB, pageSize int, salt1, salt2 uint32, pa
 	binary.BigEndian.PutUint32(header[12:], 1)
 	binary.BigEndian.PutUint32(header[16:], salt1)
 	binary.BigEndian.PutUint32(header[20:], salt2)
-	s0, s1 := WALChecksum(bo, 0, 0, header[:24])
+	s0, s1 := activity160599WALChecksum(bo, 0, 0, header[:24])
 	binary.BigEndian.PutUint32(header[24:], s0)
 	binary.BigEndian.PutUint32(header[28:], s1)
 
@@ -1210,11 +1210,22 @@ func activity160599BuildWAL(tb testing.TB, pageSize int, salt1, salt2 uint32, pa
 	binary.BigEndian.PutUint32(frame[8:], salt1)
 	binary.BigEndian.PutUint32(frame[12:], salt2)
 	copy(wal[WALHeaderSize+WALFrameHeaderSize:], page)
-	s0, s1 = WALChecksum(bo, s0, s1, frame[:8])
-	s0, s1 = WALChecksum(bo, s0, s1, page)
+	s0, s1 = activity160599WALChecksum(bo, s0, s1, frame[:8])
+	s0, s1 = activity160599WALChecksum(bo, s0, s1, page)
 	binary.BigEndian.PutUint32(frame[16:], s0)
 	binary.BigEndian.PutUint32(frame[20:], s1)
 	return wal
+}
+
+func activity160599WALChecksum(bo binary.ByteOrder, s0, s1 uint32, b []byte) (uint32, uint32) {
+	if len(b)%8 != 0 {
+		panic("misaligned checksum byte slice")
+	}
+	for i := 0; i < len(b); i += 8 {
+		s0 += bo.Uint32(b[i:]) + s1
+		s1 += bo.Uint32(b[i+4:]) + s0
+	}
+	return s0, s1
 }
 
 func activity160599AssertNoArtifacts(tb testing.TB, output string) {

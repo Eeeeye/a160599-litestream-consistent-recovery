@@ -409,7 +409,7 @@ index 7921c82..c8dd754 100644
 -
 -	return 0, fmt.Errorf("max retries exceeded reading ltx file (level=%d, min=%s, max=%s, offset=%d)",
 -		r.level, r.minTXID, r.maxTXID, r.offset)
-@@ -132,0 +176,25 @@ func (r *ResumableReader) Close() error {
+@@ -132,0 +176,27 @@ func (r *ResumableReader) Close() error {
 +
 +// Err returns the terminal read error, if any. This is also used by restore
 +// orchestration to recover errors swallowed by an older compactor header path.
@@ -419,7 +419,9 @@ index 7921c82..c8dd754 100644
 +	if r.rc == nil {
 +		return
 +	}
-+	if err := r.rc.Close(); err != nil {
++	rc := r.rc
++	r.rc = nil
++	if err := rc.Close(); err != nil {
 +		r.logger.Debug("close ltx file",
 +			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
 +			"offset", r.offset, "error", err)
