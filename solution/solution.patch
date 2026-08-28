@@ -10,15 +10,16 @@ index fe1df40..149452b 100644
 -		return info, nil
 -	}
 -
-diff --git dst/follow_commit.go dst/follow_commit.go
+diff --git src/follow_commit.go dst/follow_commit.go
 new file mode 100644
-index 0000000..c045ef5
+index 0000000..702eb8c
 --- /dev/null
 +++ dst/follow_commit.go
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,304 @@
 +package litestream
 +
 +import (
++	"bytes"
 +	"crypto/sha256"
 +	"encoding/hex"
 +	"encoding/json"
@@ -149,8 +150,15 @@ index 0000000..c045ef5
 +	if toTXID <= fromTXID {
 +		return 0, fmt.Errorf("invalid follow record range: %s..%s", fromTXID, toTXID)
 +	}
++	if fromTXID == 0 {
++		if record.OldSize != -1 || record.OldSHA256 != "" {
++			return 0, fmt.Errorf("invalid initial follow record old identity")
++		}
++	} else if record.OldSize < 0 || !validFollowSHA256(record.OldSHA256) {
++		return 0, fmt.Errorf("invalid follow record old identity")
++	}
 +
-+	stagePath, err := followStagePath(outputPath, record.Stage)
++	stagePath, err := followStagePath(outputPath, record.Stage, fromTXID == 0)
 +	if err != nil {
 +		return 0, err
 +	}
@@ -233,13 +241,36 @@ index 0000000..c045ef5
 +	if err != nil {
 +		return record, err
 +	}
-+	if err := json.Unmarshal(data, &record); err != nil {
++	if len(data) == 0 || data[len(data)-1] != '\n' {
++		return record, fmt.Errorf("follow record is not newline terminated")
++	}
++
++	var fields map[string]json.RawMessage
++	if err := json.Unmarshal(data, &fields); err != nil {
 +		return record, fmt.Errorf("decode follow record: %w", err)
++	}
++	wantFields := []string{"version", "from_txid", "to_txid", "stage", "old_size", "old_sha256", "new_size", "new_sha256"}
++	if len(fields) != len(wantFields) {
++		return record, fmt.Errorf("follow record has %d fields, want %d", len(fields), len(wantFields))
++	}
++	for _, name := range wantFields {
++		if _, ok := fields[name]; !ok {
++			return record, fmt.Errorf("follow record missing field %q", name)
++		}
++	}
++
++	dec := json.NewDecoder(bytes.NewReader(data))
++	dec.DisallowUnknownFields()
++	if err := dec.Decode(&record); err != nil {
++		return record, fmt.Errorf("decode typed follow record: %w", err)
++	}
++	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
++		return record, fmt.Errorf("follow record has trailing data")
 +	}
 +	if record.Version != followCommitRecordVersion {
 +		return record, fmt.Errorf("unsupported follow record version: %d", record.Version)
 +	}
-+	if record.NewSize < 0 || len(record.NewSHA256) != sha256.Size*2 {
++	if record.NewSize < 0 || !validFollowSHA256(record.NewSHA256) {
 +		return record, fmt.Errorf("invalid follow record new identity")
 +	}
 +	return record, nil
@@ -255,13 +286,24 @@ index 0000000..c045ef5
 +	return nil
 +}
 +
-+func followStagePath(outputPath, name string) (string, error) {
++func followStagePath(outputPath, name string, initial bool) (string, error) {
 +	base := "." + filepath.Base(outputPath)
-+	validPrefix := strings.HasPrefix(name, base+"-follow-") || strings.HasPrefix(name, base+"-restore-")
-+	if name == "" || filepath.Base(name) != name || !validPrefix {
++	prefix := base + "-follow-"
++	if initial {
++		prefix = base + "-restore-"
++	}
++	if name == "" || filepath.Base(name) != name || !strings.HasPrefix(name, prefix) {
 +		return "", fmt.Errorf("invalid follow record staging name %q", name)
 +	}
 +	return filepath.Join(filepath.Dir(outputPath), name), nil
++}
++
++func validFollowSHA256(s string) bool {
++	if len(s) != sha256.Size*2 || s != strings.ToLower(s) {
++		return false
++	}
++	_, err := hex.DecodeString(s)
++	return err == nil
 +}
 +
 +func fileIdentity(path string) (int64, string, error) {
@@ -297,7 +339,7 @@ index b7afddd..21a5558 100644
 +}
 +
 diff --git src/internal/resumable_reader.go dst/internal/resumable_reader.go
-index 7921c82..c8dd754 100644
+index 7921c82..0234ce6 100644
 --- src/internal/resumable_reader.go
 +++ dst/internal/resumable_reader.go
 @@ -5,0 +6 @@ import (

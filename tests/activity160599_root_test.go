@@ -1066,6 +1066,256 @@ func TestActivity160599InitialFollowPublicationRecoversMissingTXID(t *testing.T)
 	activity160599AssertNoFollowArtifacts(t, path)
 }
 
+func TestActivity160599FollowRecoveryRejectsPathTraversalAndMalformedState(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(map[string]any)
+		trimNewline bool
+		sidecar     ltx.TXID
+	}{
+		{
+			name: "path-traversing-stage",
+			mutate: func(record map[string]any) {
+				record["stage"] = "../outside.db"
+			},
+		},
+		{
+			name: "missing-required-field",
+			mutate: func(record map[string]any) {
+				delete(record, "old_size")
+			},
+		},
+		{
+			name: "unknown-extra-field",
+			mutate: func(record map[string]any) {
+				record["unexpected"] = true
+			},
+		},
+		{
+			name: "wrong-field-type",
+			mutate: func(record map[string]any) {
+				record["old_size"] = "4096"
+			},
+		},
+		{
+			name: "inconsistent-old-identity",
+			mutate: func(record map[string]any) {
+				record["old_size"] = -1
+				record["old_sha256"] = ""
+			},
+		},
+		{
+			name: "non-lowercase-sha256",
+			mutate: func(record map[string]any) {
+				record["new_sha256"] = strings.Repeat("A", sha256.Size*2)
+			},
+		},
+		{
+			name:        "unterminated-json-record",
+			trimNewline: true,
+		},
+		{
+			name: "restore-stage-on-later-poll",
+			mutate: func(record map[string]any) {
+				record["stage"] = ".recover.db-restore-wrong-generation"
+			},
+		},
+		{
+			name:    "impossible-sidecar",
+			sidecar: 3,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			const pageSize = 4096
+			dir := t.TempDir()
+			path := filepath.Join(dir, "recover.db")
+			visible := bytes.Repeat([]byte{0x31}, pageSize)
+			if err := os.WriteFile(path, visible, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			sidecar := tc.sidecar
+			if sidecar == 0 {
+				sidecar = 1
+			}
+			if err := WriteTXIDFile(path, sidecar); err != nil {
+				t.Fatal(err)
+			}
+
+			oldSHA := sha256.Sum256(visible)
+			record := map[string]any{
+				"version":    1,
+				"from_txid":  "0000000000000001",
+				"to_txid":    "0000000000000002",
+				"stage":      ".recover.db-follow-stage",
+				"old_size":   pageSize,
+				"old_sha256": fmt.Sprintf("%x", oldSHA),
+				"new_size":   pageSize,
+				"new_sha256": strings.Repeat("2", sha256.Size*2),
+			}
+			if tc.mutate != nil {
+				tc.mutate(record)
+			}
+			data, err := json.Marshal(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.trimNewline {
+				data = append(data, '\n')
+			}
+			if err := os.WriteFile(path+"-follow", data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			outside := filepath.Clean(filepath.Join(dir, "../outside.db"))
+			outsideData := []byte("path traversal sentinel")
+			if err := os.WriteFile(outside, outsideData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			err = NewReplicaWithClient(nil, &activity160599Client{}).Restore(
+				ctx, RestoreOptions{OutputPath: path, Follow: true, FollowInterval: time.Millisecond},
+			)
+			if err == nil {
+				t.Fatal("malformed or path-traversing follow state was accepted")
+			}
+			got, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !bytes.Equal(got, visible) {
+				t.Fatal("failed-closed recovery modified the visible database")
+			}
+			if txid, readErr := ReadTXIDFile(path); readErr != nil || txid != sidecar {
+				t.Fatalf("failed-closed recovery changed sidecar: txid=%s err=%v", txid, readErr)
+			}
+			if gotOutside, readErr := os.ReadFile(outside); readErr != nil || !bytes.Equal(gotOutside, outsideData) {
+				t.Fatalf("path traversal touched outside sentinel: data=%q err=%v", gotOutside, readErr)
+			}
+			if _, statErr := os.Stat(path + "-follow"); statErr != nil {
+				t.Fatalf("failed-closed recovery removed evidence record: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestActivity160599FollowerUpdatePreservesFileMode(t *testing.T) {
+	const pageSize = 4096
+	update := activity160599BuildLTX(t, 2, 2, pageSize, 1, bytes.Repeat([]byte{0x65}, pageSize), 41, 42, WALHeaderSize, WALFrameHeaderSize+pageSize)
+	info := &ltx.FileInfo{Level: 0, MinTXID: 2, MaxTXID: 2, Size: int64(len(update))}
+	client := &activity160599Client{
+		files: func(level int) []*ltx.FileInfo {
+			if level == 0 {
+				return []*ltx.FileInfo{info}
+			}
+			return nil
+		},
+		open: func(level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			return activity160599RangeReader(update, offset, size)
+		},
+	}
+
+	path := filepath.Join(t.TempDir(), "mode.db")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0x19}, pageSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteTXIDFile(path, 1); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	gotTXID, err := NewReplicaWithClient(nil, client).applyNewLTXFiles(context.Background(), f, 1, pageSize)
+	if err != nil {
+		t.Fatalf("apply follower update: %v", err)
+	}
+	if gotTXID != 2 {
+		t.Fatalf("updated txid=%s, want 2", gotTXID)
+	}
+	stat, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stat.Mode().Perm(); got != 0o640 {
+		t.Fatalf("follower mode=%#o, want %#o", got, os.FileMode(0o640))
+	}
+}
+
+func TestActivity160599FollowerUsesHigherLevelGapFill(t *testing.T) {
+	const pageSize = 4096
+	page1 := bytes.Repeat([]byte{0x72}, pageSize)
+	page2 := bytes.Repeat([]byte{0x84}, pageSize)
+	level1Data := activity160599BuildLTX(t, 2, 3, pageSize, 2, page1, 51, 52, WALHeaderSize, 2*(WALFrameHeaderSize+pageSize))
+	level0Data := activity160599BuildLTXPages(
+		t, 4, 4, pageSize, 2, 53, 54, WALHeaderSize+2*(WALFrameHeaderSize+pageSize), WALFrameHeaderSize+pageSize,
+		activity160599LTXPage{pgno: 2, data: page2},
+	)
+	level1 := &ltx.FileInfo{Level: 1, MinTXID: 2, MaxTXID: 3, Size: int64(len(level1Data))}
+	level0 := &ltx.FileInfo{Level: 0, MinTXID: 4, MaxTXID: 4, Size: int64(len(level0Data))}
+	client := &activity160599Client{
+		files: func(level int) []*ltx.FileInfo {
+			switch level {
+			case 0:
+				return []*ltx.FileInfo{level0}
+			case 1:
+				return []*ltx.FileInfo{level1}
+			default:
+				return nil
+			}
+		},
+		open: func(level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			switch activity160599Key(level, minTXID, maxTXID) {
+			case activity160599Key(1, 2, 3):
+				return activity160599RangeReader(level1Data, offset, size)
+			case activity160599Key(0, 4, 4):
+				return activity160599RangeReader(level0Data, offset, size)
+			default:
+				return nil, os.ErrNotExist
+			}
+		},
+	}
+
+	path := filepath.Join(t.TempDir(), "gap.db")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0x18}, pageSize*2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteTXIDFile(path, 1); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	gotTXID, err := NewReplicaWithClient(nil, client).applyNewLTXFiles(context.Background(), f, 1, pageSize)
+	if err != nil {
+		t.Fatalf("apply gap-filled poll: %v", err)
+	}
+	if gotTXID != 4 {
+		t.Fatalf("gap-filled txid=%s, want 4", gotTXID)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != pageSize*2 || got[0] != 0x72 || got[pageSize] != 0x84 {
+		t.Fatalf("gap-filled image mismatch: size=%d page1=%#x page2=%#x", len(got), got[0], got[pageSize])
+	}
+	if txid, err := ReadTXIDFile(path); err != nil || txid != 4 {
+		t.Fatalf("gap-filled sidecar=%s err=%v, want 4", txid, err)
+	}
+	activity160599AssertNoFollowArtifacts(t, path)
+}
+
 type activity160599Client struct {
 	mu        sync.Mutex
 	deleted   bool

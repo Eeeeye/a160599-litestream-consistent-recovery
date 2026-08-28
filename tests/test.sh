@@ -23,7 +23,7 @@ if ! timeout 180s go test -count=1 -run '^TestActivity160599' . ./internal; then
   exit 1
 fi
 
-if ! timeout 240s go test -race -count=1 -run '^TestActivity160599(ConcurrentRestoresPublishExactlyOnce|FollowerBatchIsAllOrNothing|FollowerCommitRecoveryIsIdentityChecked|InitialFollowPublicationRecoversMissingTXID|ResumableReader)' . ./internal; then
+if ! timeout 240s go test -race -count=1 -run '^TestActivity160599(ConcurrentRestoresPublishExactlyOnce|FollowerBatchIsAllOrNothing|FollowerCommitRecoveryIsIdentityChecked|InitialFollowPublicationRecoversMissingTXID|FollowRecoveryRejectsPathTraversalAndMalformedState|FollowerUpdatePreservesFileMode|FollowerUsesHigherLevelGapFill|ResumableReader)' . ./internal; then
   exit 1
 fi
 
