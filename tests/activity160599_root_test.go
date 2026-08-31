@@ -1111,6 +1111,22 @@ func TestActivity160599FollowRecoveryRejectsPathTraversalAndMalformedState(t *te
 			},
 		},
 		{
+			name:    "non-lowercase-from-txid",
+			sidecar: 10,
+			mutate: func(record map[string]any) {
+				record["from_txid"] = "000000000000000A"
+				record["to_txid"] = "000000000000000b"
+			},
+		},
+		{
+			name:    "non-lowercase-to-txid",
+			sidecar: 10,
+			mutate: func(record map[string]any) {
+				record["from_txid"] = "000000000000000a"
+				record["to_txid"] = "000000000000000B"
+			},
+		},
+		{
 			name:        "unterminated-json-record",
 			trimNewline: true,
 		},

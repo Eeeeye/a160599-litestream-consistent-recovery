@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..702eb8c
 --- /dev/null
 +++ dst/follow_commit.go
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,307 @@
 +package litestream
 +
 +import (
@@ -146,6 +146,9 @@ index 0000000..702eb8c
 +	toTXID, err := ltx.ParseTXID(record.ToTXID)
 +	if err != nil {
 +		return 0, fmt.Errorf("parse follow record to txid: %w", err)
++	}
++	if fromTXID.String() != record.FromTXID || toTXID.String() != record.ToTXID {
++		return 0, fmt.Errorf("follow record txids are not canonical lowercase 16-digit hexadecimal strings")
 +	}
 +	if toTXID <= fromTXID {
 +		return 0, fmt.Errorf("invalid follow record range: %s..%s", fromTXID, toTXID)
